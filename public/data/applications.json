@@ -150,5 +150,13 @@
     "link": "https://wellfound.com/jobs?job_listing_slug=4015386-machine-learning-intern",
     "company": "Dataqueue",
     "category": "startup"
+  },
+  {
+    "position": "Test Position",
+    "date": "",
+    "status": "applied",
+    "link": "",
+    "company": "Test",
+    "category": "company"
   }
 ]
