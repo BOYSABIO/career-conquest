@@ -2,7 +2,12 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import { Application as AppData, Territory, MapDimensions } from "@/lib/types";
-import { computeMapLayout, computePath } from "@/lib/map-layout";
+import {
+  computeMapLayout,
+  computeObjectivePath,
+  ObjectiveType,
+  RoutingData,
+} from "@/lib/map-layout";
 import { renderWorldBackground } from "@/lib/terrain";
 import {
   generateMarchingFrames,
@@ -15,12 +20,25 @@ import {
   generateFlagBearerFrames,
   generateSuperSoldierFrames,
   generateDragonFrames,
+  generateRestingFrames,
+  generateCelebratingFrames,
+  generateRetreatingFrames,
+  generateCampSiteFrames,
   SpriteFrames,
 } from "@/lib/sprites";
+import { BattleImpactEvent } from "@/lib/battle/interaction";
+import { BATTLE_BALANCE, BATTLE_TIMINGS, CAMPAIGN, INTERACTION_BALANCE } from "@/lib/battle/constants";
+import {
+  isActiveSideFormation,
+  randomRespawnDelay,
+  retreatSucceeded,
+  tickRespawnCooldown,
+} from "@/lib/battle/campaign";
 
 interface BattleMapProps {
   applications: AppData[];
   onStatsUpdate?: (stats: MapStats) => void;
+  onReady?: () => void;
 }
 
 export interface MapStats {
@@ -38,6 +56,8 @@ interface FormationSoldier {
   col: number;
   type: SoldierType;
   frameOffset: number;
+  /** Set for retreat survivors — muted / wounded draw */
+  wounded?: boolean;
 }
 
 type FormationState =
@@ -46,24 +66,42 @@ type FormationState =
   | "fighting"   // engaged in skirmish, stopped, swinging weapons
   | "sieging"     // arrived at fortress, attacking
   | "dissolving"  // fading out after siege
-  | "cooldown";   // waiting to respawn
+  | "cooldown"   // brief terminal state before removal (siege cycle)
+  | "buildingCamp" // winner erecting tent & fire (then rest or celebrate)
+  | "camping"    // rest by the fire
+  | "celebrating"
+  | "retreating"; // loser heading home
 
 interface Formation {
+  id: number;
   t: number;
   speed: number;
+  moraleBoost: number;
   soldiers: FormationSoldier[];
   state: FormationState;
   stateTimer: number;
   isDefender: boolean;
   opacity: number;
   reinforcementType?: "ram" | "super" | "dragon";
+  objective: ObjectiveType;
+  path: { x: number; y: number }[];
+  objectiveLock: number;
+  skirmishId: number | null;
+  campAnchor: { x: number; y: number } | null;
+  /** Failed retreat: dissolving into corpses before removal */
+  retreatFailed?: boolean;
 }
 
 interface Skirmish {
+  id: number;
   x: number;
   y: number;
   timer: number;
   maxTimer: number;
+  attackerFormationId: number;
+  defenderFormationId: number;
+  attackerWon: boolean;
+  resolved: boolean;
 }
 
 interface SiegeArrow {
@@ -78,13 +116,20 @@ interface SiegeArrow {
 interface TroopLine {
   territory: Territory;
   path: { x: number; y: number }[];
+  castleX: number;
+  castleY: number;
   formations: Formation[];
   skirmishes: Skirmish[];
   arrows: SiegeArrow[];
   arrowCooldown: number;
   catapultCooldown: number;
   status: Territory["status"];
-  spawnCooldown: number;
+  attackerRespawnCooldown: number;
+  defenderRespawnCooldown: number;
+  nextFormationId: number;
+  nextSkirmishId: number;
+  attackersWiped: boolean;
+  defendersWiped: boolean;
 }
 
 interface LiveEffect {
@@ -130,19 +175,140 @@ function buildFormationSoldiers(isDefender: boolean): FormationSoldier[] {
   return soldiers;
 }
 
-function createFormation(isDefender: boolean, startT: number): Formation {
+function createFormation(line: TroopLine, isDefender: boolean, startT: number): Formation {
   return {
+    id: line.nextFormationId++,
     t: startT,
     speed: 0.00015 + Math.random() * 0.00008,
+    moraleBoost: 0,
     soldiers: buildFormationSoldiers(isDefender),
     state: "spawning",
     stateTimer: 0,
     isDefender,
     opacity: 0,
+    objective: isDefender ? "toSkirmishMidpoint" : "toFortress",
+    path: [],
+    objectiveLock: 0,
+    skirmishId: null,
+    campAnchor: null,
   };
 }
 
-export default function BattleMap({ applications, onStatsUpdate }: BattleMapProps) {
+function lineHasActiveSide(line: TroopLine, isDefender: boolean): boolean {
+  return line.formations.some(
+    (f) => f.isDefender === isDefender && isActiveSideFormation(f.state)
+  );
+}
+
+function randomLineRespawnDelay(): number {
+  return (
+    BATTLE_BALANCE.lineSpawnCooldownMin +
+    Math.floor(
+      Math.random() *
+        (BATTLE_BALANCE.lineSpawnCooldownMax - BATTLE_BALANCE.lineSpawnCooldownMin)
+    )
+  );
+}
+
+/** Survivors limping home — fewer figures, marked wounded */
+function cullSoldiersForRetreat(soldiers: FormationSoldier[]): FormationSoldier[] {
+  const minR = CAMPAIGN.retreatSurvivorMinRatio;
+  const maxR = CAMPAIGN.retreatSurvivorMaxRatio;
+  const ratio = minR + Math.random() * (maxR - minR);
+  const target = Math.max(1, Math.ceil(soldiers.length * ratio));
+  const shuffled = [...soldiers].sort(() => Math.random() - 0.5);
+  const picked = shuffled.slice(0, target);
+  const cols = Math.min(2, picked.length);
+  return picked.map((s, i) => ({
+    ...s,
+    row: Math.floor(i / cols),
+    col: i % cols,
+    type: i === 0 ? s.type : "spear",
+    frameOffset: s.frameOffset + i,
+    wounded: true,
+  }));
+}
+
+function resolveObjectivePath(
+  routingData: RoutingData,
+  line: TroopLine,
+  formation: Formation
+): { x: number; y: number }[] {
+  const objectivePath = computeObjectivePath(
+    formation.objective,
+    {
+      territoryX: line.territory.x,
+      territoryY: line.territory.y,
+      castleX: line.castleX,
+      castleY: line.castleY,
+    },
+    routingData,
+    formation.soldiers[0]?.frameOffset ?? 0,
+    80
+  );
+  if (objectivePath.length >= 2) return objectivePath;
+  return line.path;
+}
+
+function formationPosition(formation: Formation): { x: number; y: number } | null {
+  if (
+    formation.campAnchor &&
+    (formation.state === "buildingCamp" ||
+      formation.state === "camping" ||
+      formation.state === "celebrating")
+  ) {
+    return formation.campAnchor;
+  }
+  if (formation.path.length < 2) return null;
+  const idx = Math.floor(Math.max(0, Math.min(1, formation.t)) * (formation.path.length - 1));
+  return formation.path[idx];
+}
+
+function routePointAtT(route: { x: number; y: number }[], t: number): { x: number; y: number } | null {
+  if (route.length < 2) return null;
+  const idx = Math.floor(Math.max(0, Math.min(1, t)) * (route.length - 1));
+  return route[idx] ?? null;
+}
+
+function closestRouteProgress(
+  route: { x: number; y: number }[],
+  point: { x: number; y: number }
+): number {
+  if (route.length < 2) return 0;
+  let bestIdx = 0;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < route.length; i++) {
+    const rp = route[i];
+    const d = (rp.x - point.x) ** 2 + (rp.y - point.y) ** 2;
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx / (route.length - 1);
+}
+
+/** Troops arranged around camp center; radius grows while building */
+function campRingOffset(
+  index: number,
+  count: number,
+  formation: Formation
+): { lx: number; ly: number; faceRight: boolean } {
+  const n = Math.max(1, count);
+  const base = -Math.PI / 2;
+  const angle = base + (index / n) * Math.PI * 2;
+  const buildT =
+    formation.state === "buildingCamp"
+      ? Math.min(1, formation.stateTimer / CAMPAIGN.campBuildDuration)
+      : 1;
+  const rx = (formation.state === "buildingCamp" ? 14 : 20) + buildT * 12;
+  const ry = 10 + buildT * 6;
+  const lx = Math.cos(angle) * rx;
+  const ly = Math.sin(angle) * ry * 0.92;
+  return { lx, ly, faceRight: lx < 0 };
+}
+
+export default function BattleMap({ applications, onStatsUpdate, onReady }: BattleMapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animFrameRef = useRef<number>(0);
   const troopLinesRef = useRef<TroopLine[]>([]);
@@ -156,6 +322,10 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
   const spritesRef = useRef<{
     marching?: SpriteFrames;
     fighting?: SpriteFrames;
+    resting?: SpriteFrames;
+    celebrating?: SpriteFrames;
+    retreating?: SpriteFrames;
+    campSite?: SpriteFrames;
     fallen?: SpriteFrames;
     catapult?: SpriteFrames;
     ram?: SpriteFrames;
@@ -169,6 +339,7 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
   const layoutRef = useRef<{
     territories: Territory[];
     dimensions: MapDimensions;
+    routingData: RoutingData;
   } | null>(null);
   const screenRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const [isReady, setIsReady] = useState(false);
@@ -188,6 +359,10 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
 
     spritesRef.current.marching = generateMarchingFrames();
     spritesRef.current.fighting = generateFightingFrames();
+    spritesRef.current.resting = generateRestingFrames();
+    spritesRef.current.celebrating = generateCelebratingFrames();
+    spritesRef.current.retreating = generateRetreatingFrames();
+    spritesRef.current.campSite = generateCampSiteFrames();
     spritesRef.current.fallen = generateFallenFrames();
     spritesRef.current.catapult = generateCatapultFrames();
     spritesRef.current.superSoldier = generateSuperSoldierFrames();
@@ -210,7 +385,8 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
     // Pre-render world background (terrain, borders, rivers, etc.)
     spritesRef.current.worldBg = renderWorldBackground(
       layout.territories,
-      layout.dimensions
+      layout.dimensions,
+      layout.routingData
     );
 
     // Center camera on castle
@@ -224,43 +400,71 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
     const lines: TroopLine[] = [];
 
     for (const territory of layout.territories) {
-      const path = computePath(
-        layout.dimensions.castleX,
-        layout.dimensions.castleY,
-        territory.x,
-        territory.y
+      const path = computeObjectivePath(
+        "toFortress",
+        {
+          territoryX: territory.x,
+          territoryY: territory.y,
+          castleX: layout.dimensions.castleX,
+          castleY: layout.dimensions.castleY,
+        },
+        layout.routingData,
+        0,
+        80
       );
 
       if (territory.status === "fallen") {
         lines.push({
-          territory, path, formations: [], skirmishes: [],
+          territory, path, castleX: layout.dimensions.castleX, castleY: layout.dimensions.castleY,
+          formations: [], skirmishes: [],
           arrows: [], arrowCooldown: 0, catapultCooldown: 0,
-          status: territory.status, spawnCooldown: 0,
+          status: territory.status,
+          attackerRespawnCooldown: 0,
+          defenderRespawnCooldown: 0,
+          nextFormationId: 1,
+          nextSkirmishId: 1,
+          attackersWiped: false, defendersWiped: false,
         });
         continue;
       }
 
       const formations: Formation[] = [];
 
-      // First attacker: start already marching partway so map isn't empty
-      const attacker = createFormation(false, 0.15 + Math.random() * 0.3);
-      attacker.state = "marching";
-      attacker.opacity = 1;
-      formations.push(attacker);
-
-      // First defender: start coming back from the fortress
-      const defender = createFormation(true, 0.7 + Math.random() * 0.2);
-      defender.state = "marching";
-      defender.opacity = 1;
-      formations.push(defender);
-
-      lines.push({
-        territory, path, formations, skirmishes: [],
+      const line: TroopLine = {
+        territory, path,
+        castleX: layout.dimensions.castleX,
+        castleY: layout.dimensions.castleY,
+        formations,
+        skirmishes: [],
         arrows: [], arrowCooldown: 0,
         catapultCooldown: 600 + Math.floor(Math.random() * 800),
         status: territory.status,
-        spawnCooldown: 300 + Math.floor(Math.random() * 200),
-      });
+        attackerRespawnCooldown: 0,
+        defenderRespawnCooldown: 0,
+        nextFormationId: 1,
+        nextSkirmishId: 1,
+        attackersWiped: false,
+        defendersWiped: false,
+      };
+
+      // First attacker: start already marching partway so map isn't empty
+      const attacker = createFormation(line, false, 0.15 + Math.random() * 0.3);
+      attacker.state = "marching";
+      attacker.opacity = 1;
+      attacker.objective = "toFortress";
+      formations.push(attacker);
+
+      // First defender: start coming back from the fortress
+      const defender = createFormation(line, true, 0.25 + Math.random() * 0.2);
+      defender.state = "marching";
+      defender.opacity = 1;
+      defender.objective = "toSkirmishMidpoint";
+      formations.push(defender);
+
+      for (const formation of line.formations) {
+        formation.path = resolveObjectivePath(layout.routingData, line, formation);
+      }
+      lines.push(line);
     }
     troopLinesRef.current = lines;
 
@@ -441,12 +645,10 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
     // ========== FORMATION LIFECYCLE UPDATE + RENDER ==========
     const ROW_SPACING = 14;
     const COL_SPACING = 10;
-    const SPAWN_DURATION = 60;
-    const FIGHT_DURATION = 120;
-    const SIEGE_DURATION = 180;
-    const DISSOLVE_DURATION = 50;
-    const SKIRMISH_DURATION = 90;
-
+    const SPAWN_DURATION = BATTLE_TIMINGS.spawnDuration;
+    const FIGHT_DURATION = BATTLE_TIMINGS.fightDuration;
+    const SIEGE_DURATION = BATTLE_TIMINGS.siegeDuration;
+    const DISSOLVE_DURATION = BATTLE_TIMINGS.dissolveDuration;
     for (const line of troopLinesRef.current) {
       // -- Fallen territories: just draw corpses --
       if (line.status === "fallen") {
@@ -460,45 +662,83 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
         continue;
       }
 
-      // -- Spawn cooldown: periodically spawn new waves --
-      line.spawnCooldown--;
-      if (line.spawnCooldown <= 0) {
-        const hasActiveAttacker = line.formations.some(
-          (f) => !f.isDefender && f.state !== "cooldown"
-        );
-        const hasActiveDefender = line.formations.some(
-          (f) => f.isDefender && f.state !== "cooldown"
-        );
+      line.attackerRespawnCooldown = tickRespawnCooldown(line.attackerRespawnCooldown);
+      line.defenderRespawnCooldown = tickRespawnCooldown(line.defenderRespawnCooldown);
 
-        if (!hasActiveAttacker) {
-          line.formations.push(createFormation(false, 0));
+      if (!lineHasActiveSide(line, false) && line.attackerRespawnCooldown <= 0) {
+        const attacker = createFormation(line, false, 0);
+        attacker.objective = "toFortress";
+        attacker.path = resolveObjectivePath(layout.routingData, line, attacker);
+        line.formations.push(attacker);
+      }
+      if (!lineHasActiveSide(line, true) && line.defenderRespawnCooldown <= 0) {
+        const defender = createFormation(line, true, 0);
+        defender.objective = "toSkirmishMidpoint";
+        defender.path = resolveObjectivePath(layout.routingData, line, defender);
+        line.formations.push(defender);
+      }
+
+      const activeAttackers = line.formations.filter(
+        (f) => !f.isDefender && f.state !== "cooldown" && f.state !== "dissolving"
+      );
+      const activeDefenders = line.formations.filter(
+        (f) => f.isDefender && f.state !== "cooldown" && f.state !== "dissolving"
+      );
+
+      // Edge-triggered wipe events.
+      if (activeAttackers.length === 0 && activeDefenders.length > 0 && !line.attackersWiped) {
+        line.attackersWiped = true;
+        for (const defender of activeDefenders) {
+          const currentPos = formationPosition(defender);
+          defender.objective = "toCastle";
+          defender.path = resolveObjectivePath(layout.routingData, line, defender);
+          if (currentPos) {
+            defender.t = closestRouteProgress(defender.path, currentPos);
+          }
+          defender.objectiveLock = 160;
         }
-        if (!hasActiveDefender) {
-          line.formations.push(createFormation(true, 1));
+      } else if (activeAttackers.length > 0) {
+        line.attackersWiped = false;
+      }
+
+      if (activeDefenders.length === 0 && activeAttackers.length > 0 && !line.defendersWiped) {
+        line.defendersWiped = true;
+        for (const attacker of activeAttackers) {
+          const currentPos = formationPosition(attacker);
+          attacker.objective = "toFortress";
+          attacker.path = resolveObjectivePath(layout.routingData, line, attacker);
+          if (currentPos) {
+            attacker.t = closestRouteProgress(attacker.path, currentPos);
+          }
+          attacker.objectiveLock = 120;
         }
-        line.spawnCooldown = 400 + Math.floor(Math.random() * 300);
+      } else if (activeDefenders.length > 0) {
+        line.defendersWiped = false;
       }
 
       // -- Enemy catapult: fortress fires when attackers get close --
       line.catapultCooldown--;
       if (line.catapultCooldown <= 0) {
-        const CATAPULT_RANGE = 180;
+        const CATAPULT_RANGE = BATTLE_BALANCE.catapultRange;
         const tx = line.territory.x;
         const ty = line.territory.y;
 
         // Only fire at attackers within range of the fortress
         const nearbyAttackers = line.formations.filter((f) => {
           if (f.isDefender || f.state !== "marching") return false;
-          const idx = Math.floor(f.t * (line.path.length - 1));
-          const pt = line.path[idx];
+          const pt = formationPosition(f);
+          if (!pt) return false;
           const dist = Math.sqrt((pt.x - tx) ** 2 + (pt.y - ty) ** 2);
           return dist < CATAPULT_RANGE;
         });
 
         if (nearbyAttackers.length > 0) {
           const target = nearbyAttackers[Math.floor(Math.random() * nearbyAttackers.length)];
-          const targetPathIdx = Math.floor(target.t * (line.path.length - 1));
-          const targetPos = line.path[targetPathIdx];
+          const targetPos = formationPosition(target);
+          if (!targetPos) {
+            line.catapultCooldown = 60;
+            continue;
+          }
 
           effectsRef.current.push({
             type: "catapult",
@@ -509,7 +749,12 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
             frame: 0,
             maxFrames: 150,
           });
-          line.catapultCooldown = 300 + Math.floor(Math.random() * 200);
+          line.catapultCooldown =
+            BATTLE_BALANCE.catapultCooldownMin +
+            Math.floor(
+              Math.random() *
+                (BATTLE_BALANCE.catapultCooldownMax - BATTLE_BALANCE.catapultCooldownMin)
+            );
         } else {
           line.catapultCooldown = 60;
         }
@@ -519,6 +764,7 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
       for (let fi = line.formations.length - 1; fi >= 0; fi--) {
         const formation = line.formations[fi];
         formation.stateTimer++;
+        if (formation.objectiveLock > 0) formation.objectiveLock--;
 
         switch (formation.state) {
           case "spawning":
@@ -531,25 +777,142 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
             break;
 
           case "marching":
-            if (formation.isDefender) {
-              formation.t -= formation.speed;
-              if (formation.t <= 0.08) {
-                formation.state = "dissolving";
-                formation.stateTimer = 0;
-              }
-            } else {
-              formation.t += formation.speed;
-              if (formation.t >= 0.92) {
+            formation.t += formation.speed;
+            if (formation.t >= 0.92) {
+              if (!formation.isDefender && formation.objective === "toFortress") {
                 formation.state = "sieging";
                 formation.stateTimer = 0;
+              } else {
+                formation.state = "dissolving";
+                formation.stateTimer = 0;
+                formation.retreatFailed = undefined;
               }
             }
             break;
 
           case "fighting":
             if (formation.stateTimer >= FIGHT_DURATION) {
+              const sk =
+                formation.skirmishId != null
+                  ? line.skirmishes.find((s) => s.id === formation.skirmishId)
+                  : null;
+              if (sk && !sk.resolved) {
+                sk.resolved = true;
+                const attacker = line.formations.find(
+                  (f) => f.id === sk.attackerFormationId
+                );
+                const defender = line.formations.find(
+                  (f) => f.id === sk.defenderFormationId
+                );
+                if (attacker && defender) {
+                  const winner = sk.attackerWon ? attacker : defender;
+                  const loser = sk.attackerWon ? defender : attacker;
+                  winner.campAnchor = { x: sk.x, y: sk.y };
+                  winner.skirmishId = null;
+                  if (winner.reinforcementType) {
+                    winner.state = Math.random() < CAMPAIGN.celebrateAfterCampChance
+                      ? "celebrating"
+                      : "camping";
+                  } else {
+                    winner.state = "buildingCamp";
+                  }
+                  winner.stateTimer = 0;
+                  loser.state = "retreating";
+                  loser.stateTimer = 0;
+                  loser.skirmishId = null;
+                  loser.soldiers = cullSoldiersForRetreat(loser.soldiers);
+                  loser.objective = loser.isDefender ? "toFortress" : "toCastle";
+                  loser.path = resolveObjectivePath(layout.routingData, line, loser);
+                  const lp = formationPosition(loser);
+                  if (lp && loser.path.length >= 2) {
+                    loser.t = closestRouteProgress(loser.path, lp);
+                  } else {
+                    loser.t = 0;
+                  }
+                }
+              } else if (!sk && formation.stateTimer >= FIGHT_DURATION + 120) {
+                // Orphaned fight (e.g. skirmish record removed out of sync): end combat
+                formation.state = "dissolving";
+                formation.stateTimer = 0;
+                formation.retreatFailed = undefined;
+              }
+            }
+            break;
+
+          case "buildingCamp":
+            if (formation.stateTimer >= CAMPAIGN.campBuildDuration) {
+              formation.state = Math.random() < CAMPAIGN.celebrateAfterCampChance
+                ? "celebrating"
+                : "camping";
+              formation.stateTimer = 0;
+            }
+            break;
+
+          case "camping":
+            if (formation.stateTimer >= CAMPAIGN.campRestDuration) {
               formation.state = "marching";
               formation.stateTimer = 0;
+              formation.objective = formation.isDefender
+                ? "toSkirmishMidpoint"
+                : "toFortress";
+              formation.path = resolveObjectivePath(layout.routingData, line, formation);
+              const anchor = formation.campAnchor;
+              if (anchor && formation.path.length >= 2) {
+                formation.t = closestRouteProgress(formation.path, anchor);
+              } else {
+                formation.t = 0;
+              }
+              formation.campAnchor = null;
+              const room = Math.max(0, CAMPAIGN.moraleBoostMax - formation.moraleBoost);
+              const boost = Math.min(CAMPAIGN.campSpeedBonus, room);
+              formation.moraleBoost += boost;
+              formation.speed += boost;
+            }
+            break;
+
+          case "celebrating":
+            if (formation.stateTimer >= CAMPAIGN.celebrateDuration) {
+              formation.state = "marching";
+              formation.stateTimer = 0;
+              formation.objective = formation.isDefender
+                ? "toSkirmishMidpoint"
+                : "toFortress";
+              formation.path = resolveObjectivePath(layout.routingData, line, formation);
+              const anchor = formation.campAnchor;
+              if (anchor && formation.path.length >= 2) {
+                formation.t = closestRouteProgress(formation.path, anchor);
+              } else {
+                formation.t = 0;
+              }
+              formation.campAnchor = null;
+              const room = Math.max(0, CAMPAIGN.moraleBoostMax - formation.moraleBoost);
+              const boost = Math.min(CAMPAIGN.campSpeedBonus, room);
+              formation.moraleBoost += boost;
+              formation.speed += boost;
+            }
+            break;
+
+          case "retreating":
+            formation.t += CAMPAIGN.retreatSpeedPerFrame;
+            if (formation.t >= 0.92) {
+              if (retreatSucceeded()) {
+                formation.state = "spawning";
+                formation.stateTimer = 0;
+                formation.opacity = 0;
+                formation.retreatFailed = undefined;
+                for (const s of formation.soldiers) {
+                  delete s.wounded;
+                }
+                formation.objective = formation.isDefender
+                  ? "toSkirmishMidpoint"
+                  : "toFortress";
+                formation.path = resolveObjectivePath(layout.routingData, line, formation);
+                formation.t = 0;
+              } else {
+                formation.state = "dissolving";
+                formation.stateTimer = 0;
+                formation.retreatFailed = true;
+              }
             }
             break;
 
@@ -557,50 +920,56 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
             if (formation.stateTimer >= SIEGE_DURATION) {
               formation.state = "dissolving";
               formation.stateTimer = 0;
+              formation.retreatFailed = undefined;
             }
             break;
 
-          case "dissolving":
-            formation.opacity = Math.max(0, 1 - formation.stateTimer / DISSOLVE_DURATION);
-            if (formation.stateTimer >= DISSOLVE_DURATION) {
+          case "dissolving": {
+            const deathDur = formation.retreatFailed
+              ? CAMPAIGN.retreatDeathDuration
+              : DISSOLVE_DURATION;
+            formation.opacity = Math.max(0, 1 - formation.stateTimer / deathDur);
+            if (formation.stateTimer >= deathDur) {
               formation.state = "cooldown";
               formation.stateTimer = 0;
             }
             break;
+          }
 
           case "cooldown":
+            if (formation.isDefender) {
+              line.defenderRespawnCooldown = formation.retreatFailed
+                ? randomRespawnDelay()
+                : randomLineRespawnDelay();
+            } else {
+              line.attackerRespawnCooldown = formation.retreatFailed
+                ? randomRespawnDelay()
+                : randomLineRespawnDelay();
+            }
+            formation.retreatFailed = undefined;
             line.formations.splice(fi, 1);
             continue;
         }
 
         // -- Skirmish detection: attacker vs defender on same route --
         if (formation.state === "marching" && !formation.isDefender) {
+          const atkPos = formationPosition(formation);
+          if (!atkPos) continue;
           for (const other of line.formations) {
             if (!other.isDefender || other.state !== "marching") continue;
-            const tDist = Math.abs(formation.t - other.t);
-            if (tDist < 0.04) {
-              const skirmishPathIdx = Math.floor(
-                ((formation.t + other.t) / 2) * (line.path.length - 1)
-              );
-              const skPt = line.path[skirmishPathIdx];
+            const defPos = formationPosition(other);
+            if (!defPos) continue;
+            const posDist = Math.hypot(atkPos.x - defPos.x, atkPos.y - defPos.y);
+            // Terrain-routed lanes can diverge; allow a wider engagement radius
+            // so opposing formations still collide frequently before sieges.
+            if (posDist < 64) {
+              const skPt = { x: (atkPos.x + defPos.x) / 2, y: (atkPos.y + defPos.y) / 2 };
               const alreadyNear = line.skirmishes.some(
                 (s) => Math.abs(s.x - skPt.x) < 30 && Math.abs(s.y - skPt.y) < 30
               );
-              if (!alreadyNear) {
-                line.skirmishes.push({
-                  x: skPt.x, y: skPt.y,
-                  timer: 0, maxTimer: SKIRMISH_DURATION,
-                });
-              }
+              if (alreadyNear) continue;
 
-              // Both stop and enter fighting state
-              formation.state = "fighting";
-              formation.stateTimer = 0;
-              other.state = "fighting";
-              other.stateTimer = 0;
-
-              // Reinforcements get a combat bonus (+50% effective size)
-              const reinforcementBonus = 1.5;
+              const reinforcementBonus = BATTLE_BALANCE.reinforcementBonusMultiplier;
               const attackerSize = formation.soldiers.length *
                 (formation.reinforcementType ? reinforcementBonus : 1);
               const defenderSize = other.soldiers.length *
@@ -609,15 +978,29 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
               const attackerWinChance = attackerSize / totalSize;
               const roll = Math.random();
 
-              if (roll < attackerWinChance) {
-                // Attacker wins — defender dissolves after the fight
-                other.state = "dissolving";
-                other.stateTimer = 0;
-              } else {
-                // Defender wins — attacker dissolves after the fight
-                formation.state = "dissolving";
-                formation.stateTimer = 0;
-              }
+              const skId = line.nextSkirmishId++;
+              // maxTimer must stay > FIGHT_DURATION: sk.timer increments after the
+              // formation pass each frame, so it is one frame ahead of stateTimer.
+              // If maxTimer === FIGHT_DURATION, the skirmish is removed while
+              // formations are still at stateTimer FIGHT_DURATION - 1 and never resolve.
+              line.skirmishes.push({
+                id: skId,
+                x: skPt.x,
+                y: skPt.y,
+                timer: 0,
+                maxTimer: FIGHT_DURATION + 1,
+                attackerFormationId: formation.id,
+                defenderFormationId: other.id,
+                attackerWon: roll < attackerWinChance,
+                resolved: false,
+              });
+              formation.skirmishId = skId;
+              other.skirmishId = skId;
+
+              formation.state = "fighting";
+              formation.stateTimer = 0;
+              other.state = "fighting";
+              other.stateTimer = 0;
             }
           }
         }
@@ -627,27 +1010,65 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
       for (const formation of line.formations) {
         if (formation.state === "cooldown") continue;
 
-        const pathLen = line.path.length - 1;
-        const clampedT = Math.max(0, Math.min(1, formation.t));
-        const pathIndex = Math.floor(clampedT * pathLen);
-        const pos = line.path[pathIndex];
-        const nextIndex = Math.min(pathIndex + 1, pathLen);
-        const nextPos = line.path[nextIndex];
+        let pos: { x: number; y: number };
+        let nextPos: { x: number; y: number };
+        let dirX: number;
+        let dirY: number;
+        let perpX: number;
+        let perpY: number;
+        let facingRight: boolean;
 
-        const ddx = nextPos.x - pos.x;
-        const ddy = nextPos.y - pos.y;
-        const pathDirLen = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
-        const dirX = ddx / pathDirLen;
-        const dirY = ddy / pathDirLen;
-        const perpX = -dirY;
-        const perpY = dirX;
+        if (
+          formation.state === "buildingCamp" ||
+          formation.state === "camping" ||
+          formation.state === "celebrating"
+        ) {
+          if (!formation.campAnchor) continue;
+          pos = formation.campAnchor;
+          const tx = formation.isDefender ? line.castleX : line.territory.x;
+          const ty = formation.isDefender ? line.castleY : line.territory.y;
+          facingRight = tx - pos.x >= 0;
+          dirX = facingRight ? 1 : -1;
+          dirY = 0;
+          perpX = 0;
+          perpY = 1;
+          nextPos = { x: pos.x + dirX, y: pos.y };
+        } else {
+          const route = formation.path.length > 1 ? formation.path : line.path;
+          if (route.length < 2) continue;
+          const pathLen = route.length - 1;
+          const clampedT = Math.max(0, Math.min(1, formation.t));
+          const pathIndex = Math.floor(clampedT * pathLen);
+          pos = route[pathIndex];
+          const nextIndex = Math.min(pathIndex + 1, pathLen);
+          nextPos = route[nextIndex];
 
-        const facingRight = formation.isDefender ? ddx < 0 : ddx >= 0;
+          const ddx = nextPos.x - pos.x;
+          const ddy = nextPos.y - pos.y;
+          const pathDirLen = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+          dirX = ddx / pathDirLen;
+          dirY = ddy / pathDirLen;
+          perpX = -dirY;
+          perpY = dirX;
+          facingRight = ddx >= 0;
+        }
 
         ctx.save();
         ctx.globalAlpha = formation.opacity;
 
         const isCombat = formation.state === "fighting" || formation.state === "sieging";
+        const isRetreatDeath = formation.state === "dissolving" && formation.retreatFailed;
+        const marchSprite = isRetreatDeath
+          ? sprites.fallen
+          : formation.state === "buildingCamp"
+            ? sprites.marching
+            : formation.state === "camping"
+              ? sprites.resting ?? sprites.marching
+              : formation.state === "celebrating"
+                ? sprites.celebrating ?? sprites.marching
+                : formation.state === "retreating"
+                  ? sprites.retreating ?? sprites.marching
+                  : sprites.marching;
 
         // ---- REINFORCEMENT: Battering Ram ----
         if (formation.reinforcementType === "ram") {
@@ -687,9 +1108,13 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
 
         // ---- REINFORCEMENT: Super Soldier ----
         } else if (formation.reinforcementType === "super") {
-          const superSprite = isCombat ? sprites.fighting : sprites.superSoldier;
+          const superSprite = isCombat
+            ? sprites.fighting
+            : formation.state === "retreating"
+              ? sprites.retreating ?? sprites.superSoldier
+              : sprites.superSoldier;
           if (superSprite) {
-            const animSpeed = isCombat ? 160 : 300;
+            const animSpeed = isCombat ? 160 : formation.state === "retreating" ? 420 : 300;
             const frameIndex = Math.floor(tick / animSpeed) % superSprite.frames.length;
 
             ctx.save();
@@ -715,15 +1140,22 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
             const sx = pos.x - dirX * rowOffset + perpX * colOffset;
             const sy = pos.y - dirY * rowOffset + perpY * colOffset;
 
-            const spriteSet = isCombat ? sprites.fighting : sprites.marching;
+            const spriteSet = isCombat ? sprites.fighting : marchSprite;
             if (!spriteSet) continue;
-            const animSpeed = isCombat ? 180 : 350;
+            const animSpeed = isCombat
+              ? 180
+              : formation.state === "retreating"
+                ? 420
+                : 350;
             const frameIndex =
               Math.floor((tick + soldier.frameOffset * 120) / animSpeed) % spriteSet.frames.length;
 
             ctx.save();
             ctx.translate(sx, sy);
             if (!facingRight) ctx.scale(-1, 1);
+            if (formation.state === "retreating" && soldier.wounded) {
+              ctx.filter = "saturate(0.68) brightness(0.88) contrast(1.05)";
+            }
             ctx.drawImage(spriteSet.frames[frameIndex], -spriteSet.width / 2, -spriteSet.height / 2);
             ctx.restore();
           }
@@ -785,14 +1217,63 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
 
         // ---- NORMAL FORMATION ----
         } else {
-          const numCols = Math.max(...formation.soldiers.map((s) => s.col)) + 1;
+          const useCampRing =
+            !formation.reinforcementType &&
+            formation.campAnchor &&
+            (formation.state === "buildingCamp" ||
+              formation.state === "camping" ||
+              formation.state === "celebrating");
 
-          for (const soldier of formation.soldiers) {
-            const colOffset = (soldier.col - (numCols - 1) / 2) * COL_SPACING;
-            const rowOffset = soldier.row * ROW_SPACING;
+          const campSite = sprites.campSite;
+          if (useCampRing && campSite) {
+            if (formation.state === "buildingCamp") {
+              const fi = Math.min(
+                campSite.frames.length - 1,
+                Math.floor(
+                  (formation.stateTimer / CAMPAIGN.campBuildDuration) * campSite.frames.length
+                )
+              );
+              ctx.drawImage(
+                campSite.frames[fi],
+                pos.x - campSite.width / 2,
+                pos.y - campSite.height + 4
+              );
+            } else {
+              ctx.drawImage(
+                campSite.frames[campSite.frames.length - 1],
+                pos.x - campSite.width / 2,
+                pos.y - campSite.height + 4
+              );
+            }
+          }
 
-            let sx = pos.x - dirX * rowOffset + perpX * colOffset;
-            let sy = pos.y - dirY * rowOffset + perpY * colOffset;
+          const numCols = useCampRing
+            ? 1
+            : Math.max(...formation.soldiers.map((s) => s.col)) + 1;
+          const nSoldiers = formation.soldiers.length;
+
+          for (let si = 0; si < nSoldiers; si++) {
+            const soldier = formation.soldiers[si];
+            let sx: number;
+            let sy: number;
+            let faceSoldier: boolean;
+
+            if (useCampRing) {
+              const ring = campRingOffset(si, nSoldiers, formation);
+              sx = pos.x + ring.lx;
+              sy = pos.y + ring.ly;
+              faceSoldier = ring.faceRight;
+              if (formation.state === "buildingCamp") {
+                sx += Math.sin(tick * 0.012 + soldier.frameOffset) * 1.2;
+                sy += Math.cos(tick * 0.01 + si) * 0.8;
+              }
+            } else {
+              const colOffset = (soldier.col - (numCols - 1) / 2) * COL_SPACING;
+              const rowOffset = soldier.row * ROW_SPACING;
+              sx = pos.x - dirX * rowOffset + perpX * colOffset;
+              sy = pos.y - dirY * rowOffset + perpY * colOffset;
+              faceSoldier = facingRight;
+            }
 
             if (isCombat) {
               sx += Math.sin(tick * 0.015 + soldier.frameOffset * 2.3) * 1.5;
@@ -800,22 +1281,50 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
             }
 
             let spriteSet: SpriteFrames | undefined;
-            if (isCombat && sprites.fighting) {
+            if (isRetreatDeath && sprites.fallen) {
+              spriteSet = sprites.fallen;
+            } else if (isCombat && sprites.fighting) {
               spriteSet = sprites.fighting;
-            } else if (soldier.type === "flag" && sprites.flagBearer) {
+            } else if (
+              soldier.type === "flag" &&
+              sprites.flagBearer &&
+              formation.state !== "retreating" &&
+              formation.state !== "camping" &&
+              formation.state !== "celebrating" &&
+              formation.state !== "buildingCamp" &&
+              formation.state !== "dissolving"
+            ) {
               spriteSet = sprites.flagBearer;
             } else {
-              spriteSet = sprites.marching;
+              spriteSet = marchSprite;
             }
             if (!spriteSet) continue;
 
-            const animSpeed = isCombat ? 180 : 350;
-            const frameIndex =
-              Math.floor((tick + soldier.frameOffset * 120) / animSpeed) % spriteSet.frames.length;
+            const animSpeed = isCombat
+              ? 180
+              : formation.state === "retreating"
+                ? 420
+                : formation.state === "buildingCamp"
+                  ? 300
+                  : formation.state === "camping" || formation.state === "celebrating"
+                    ? 280
+                    : 350;
+            const frameIndex = isRetreatDeath
+              ? 0
+              : Math.floor((tick + soldier.frameOffset * 120) / animSpeed) % spriteSet.frames.length;
 
             ctx.save();
             ctx.translate(sx, sy);
-            if (!facingRight) ctx.scale(-1, 1);
+            if (!faceSoldier) ctx.scale(-1, 1);
+            if (formation.state === "retreating" && soldier.wounded) {
+              ctx.filter = "saturate(0.68) brightness(0.88) contrast(1.05)";
+            }
+            if (isRetreatDeath) {
+              ctx.translate(
+                Math.sin(soldier.frameOffset * 1.7) * 3,
+                (soldier.row + soldier.col * 0.4) * 2
+              );
+            }
             ctx.drawImage(spriteSet.frames[frameIndex], -spriteSet.width / 2, -spriteSet.height / 2);
             ctx.restore();
           }
@@ -1058,7 +1567,9 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
 
   // Expose effect trigger
   useEffect(() => {
-    (window as any).__battleMapTriggerEffect = (type: "catapult" | "ram") => {
+    (window as any).__battleMapTriggerEffect = (
+      payload: BattleImpactEvent | "catapult" | "ram"
+    ) => {
       const layout = layoutRef.current;
       if (!layout) return;
 
@@ -1069,62 +1580,99 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
       if (activeLines.length === 0) return;
 
       const targetLine = activeLines[Math.floor(Math.random() * activeLines.length)];
+      const normalizedEvent: BattleImpactEvent =
+        typeof payload === "string"
+          ? { type: payload === "catapult" ? "roast" : "encouragement", intensity: 1 }
+          : payload;
 
-      if (type === "catapult") {
-        // Roast: fire catapult at troops AND spawn enemy reinforcement
+      if (normalizedEvent.type === "roast") {
+        // Roast: fire catapult(s) at troops and spawn enemy reinforcement waves.
+        const catapultBursts = normalizedEvent.intensity;
         const attackers = targetLine.formations.filter(
           (f) => !f.isDefender && (f.state === "marching" || f.state === "sieging") && f.t > 0.1
         );
-        let targetX: number, targetY: number;
-        if (attackers.length > 0) {
-          const victim = attackers[Math.floor(Math.random() * attackers.length)];
-          const idx = Math.floor(victim.t * (targetLine.path.length - 1));
-          const pt = targetLine.path[idx];
-          targetX = pt.x + (Math.random() - 0.5) * 20;
-          targetY = pt.y + (Math.random() - 0.5) * 15;
-        } else {
-          const midIdx = Math.floor(targetLine.path.length * 0.5);
-          const midPt = targetLine.path[midIdx];
-          targetX = midPt.x + (Math.random() - 0.5) * 30;
-          targetY = midPt.y + (Math.random() - 0.5) * 20;
-        }
-        effectsRef.current.push({
-          type: "catapult",
-          x: targetLine.territory.x,
-          y: targetLine.territory.y - 10,
-          targetX,
-          targetY,
-          frame: 0,
-          maxFrames: 200,
-        });
 
-        // Spawn enemy reinforcement: dragon or ram (dragon more likely)
-        const enemyType: "dragon" | "ram" = Math.random() > 0.35 ? "dragon" : "ram";
-        const enemyReinforcement: Formation = {
-          t: 0.85,
-          speed: enemyType === "ram" ? 0.00012 : 0.0002,
-          soldiers: buildFormationSoldiers(true),
-          state: "marching",
-          stateTimer: 0,
-          isDefender: true,
-          opacity: 1,
-          reinforcementType: enemyType,
-        };
-        targetLine.formations.push(enemyReinforcement);
+        for (let burst = 0; burst < catapultBursts; burst++) {
+          let targetX: number, targetY: number;
+          if (attackers.length > 0) {
+            const victim = attackers[Math.floor(Math.random() * attackers.length)];
+            const victimRoute = victim.path.length > 1 ? victim.path : targetLine.path;
+            const pt = routePointAtT(victimRoute, victim.t);
+            if (pt) {
+              targetX = pt.x + (Math.random() - 0.5) * 20;
+              targetY = pt.y + (Math.random() - 0.5) * 15;
+            } else {
+              const midIdx = Math.floor(targetLine.path.length * 0.5);
+              const midPt = targetLine.path[midIdx];
+              targetX = midPt.x + (Math.random() - 0.5) * 30;
+              targetY = midPt.y + (Math.random() - 0.5) * 20;
+            }
+          } else {
+            const midIdx = Math.floor(targetLine.path.length * 0.5);
+            const midPt = targetLine.path[midIdx];
+            targetX = midPt.x + (Math.random() - 0.5) * 30;
+            targetY = midPt.y + (Math.random() - 0.5) * 20;
+          }
+
+          effectsRef.current.push({
+            type: "catapult",
+            x: targetLine.territory.x,
+            y: targetLine.territory.y - 10,
+            targetX,
+            targetY,
+            frame: 0,
+            maxFrames: 200,
+          });
+        }
+
+        const enemyWaves = normalizedEvent.intensity;
+        for (let wave = 0; wave < enemyWaves; wave++) {
+          const enemyType: "dragon" | "ram" =
+            Math.random() < INTERACTION_BALANCE.roastDragonChance ? "dragon" : "ram";
+          const enemyReinforcement: Formation = {
+            id: targetLine.nextFormationId++,
+            t: 0,
+            speed: enemyType === "ram" ? 0.00012 : 0.0002,
+            moraleBoost: 0,
+            soldiers: buildFormationSoldiers(true),
+            state: "spawning",
+            stateTimer: 0,
+            isDefender: true,
+            opacity: 0,
+            reinforcementType: enemyType,
+            objective: "toSkirmishMidpoint",
+            path: [],
+            objectiveLock: 0,
+            skirmishId: null,
+            campAnchor: null,
+          };
+          enemyReinforcement.path = resolveObjectivePath(layout.routingData, targetLine, enemyReinforcement);
+          targetLine.formations.push(enemyReinforcement);
+        }
       } else {
-        // Reinforcement: spawn a ram or super soldier as a real formation
-        const reinforcementType = Math.random() > 0.5 ? "ram" : "super";
-        const formation: Formation = {
-          t: 0,
-          speed: reinforcementType === "ram" ? 0.00012 : 0.0002,
-          soldiers: buildFormationSoldiers(false),
-          state: "spawning",
-          stateTimer: 0,
-          isDefender: false,
-          opacity: 0,
-          reinforcementType,
-        };
-        targetLine.formations.push(formation);
+        // Encouragement: send 1-3 reinforcement waves based on intensity.
+        for (let wave = 0; wave < normalizedEvent.intensity; wave++) {
+          const reinforcementType = Math.random() > 0.5 ? "ram" : "super";
+          const formation: Formation = {
+            id: targetLine.nextFormationId++,
+            t: 0,
+            speed: reinforcementType === "ram" ? 0.00012 : 0.0002,
+            moraleBoost: 0,
+            soldiers: buildFormationSoldiers(false),
+            state: "spawning",
+            stateTimer: 0,
+            isDefender: false,
+            opacity: 0,
+            reinforcementType,
+            objective: "toFortress",
+            path: [],
+            objectiveLock: 0,
+            skirmishId: null,
+            campAnchor: null,
+          };
+          formation.path = resolveObjectivePath(layout.routingData, targetLine, formation);
+          targetLine.formations.push(formation);
+        }
       }
     };
     return () => {
@@ -1144,12 +1692,13 @@ export default function BattleMap({ applications, onStatsUpdate }: BattleMapProp
 
   useEffect(() => {
     if (isReady) {
+      onReady?.();
       animFrameRef.current = requestAnimationFrame(render);
     }
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
-  }, [isReady, render]);
+  }, [isReady, onReady, render]);
 
   return (
     <canvas

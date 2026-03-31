@@ -1,12 +1,34 @@
 import { Application, Territory, MapDimensions } from "./types";
 
+export interface LakeObstacle {
+  x: number;
+  y: number;
+  radius: number;
+  wobble: number;
+}
+
+export interface RoadPath {
+  points: { x: number; y: number }[];
+}
+
+export interface RoutingData {
+  lakes: LakeObstacle[];
+  roads: RoadPath[];
+  cellSize: number;
+  cols: number;
+  rows: number;
+  costs: Float32Array;
+}
+
+export type ObjectiveType = "toFortress" | "toCastle" | "toSkirmishMidpoint";
+
 /**
  * World-space layout: castle at center (0, 0), territories placed radially
  * outward in all directions. World size scales with territory count.
  */
 export function computeMapLayout(
   applications: Application[]
-): { territories: Territory[]; dimensions: MapDimensions } {
+): { territories: Territory[]; dimensions: MapDimensions; routingData: RoutingData } {
   const companyMap = new Map<string, Application[]>();
   for (const app of applications) {
     const existing = companyMap.get(app.company) || [];
@@ -84,9 +106,13 @@ export function computeMapLayout(
     };
   });
 
+  const dimensions = { width: worldSize, height: worldSize, castleX, castleY };
+  const routingData = buildRoutingData(territories, dimensions);
+
   return {
     territories,
-    dimensions: { width: worldSize, height: worldSize, castleX, castleY },
+    dimensions,
+    routingData,
   };
 }
 
@@ -110,13 +136,63 @@ function seededRandom(seed: number): () => number {
 
 export { seededRandom, hashString };
 
+export function buildRoutingData(
+  territories: Territory[],
+  dimensions: MapDimensions
+): RoutingData {
+  const lakes = generateLakes(territories, dimensions);
+  const roads: RoadPath[] = [];
+  const cellSize = 28;
+  const cols = Math.ceil(dimensions.width / cellSize);
+  const rows = Math.ceil(dimensions.height / cellSize);
+  const costs = new Float32Array(cols * rows);
+
+  const terrainSeed = hashString(
+    `route-cost|${territories.map((t) => t.id).join("|")}|${Math.round(dimensions.width)}`
+  );
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const wx = x * cellSize + cellSize * 0.5;
+      const wy = y * cellSize + cellSize * 0.5;
+      const idx = y * cols + x;
+
+      const blockedByLake = lakes.some((l) => Math.hypot(wx - l.x, wy - l.y) <= l.radius * 1.15);
+      if (blockedByLake) {
+        costs[idx] = Number.POSITIVE_INFINITY;
+        continue;
+      }
+
+      const n1 = smoothNoise2d((wx / dimensions.width) * 7.2, (wy / dimensions.height) * 7.2, terrainSeed);
+      const n2 = smoothNoise2d((wx / dimensions.width) * 14.3, (wy / dimensions.height) * 14.3, terrainSeed + 41) * 0.45;
+      const field = n1 * 0.7 + n2 * 0.3;
+
+      let baseCost = 1.0; // plains
+      if (field < -0.1) baseCost = 1.55; // forest
+      else if (field > 0.28) baseCost = 2.2; // rocky
+
+      costs[idx] = baseCost;
+    }
+  }
+
+  return { lakes, roads, cellSize, cols, rows, costs };
+}
+
 export function computePath(
   castleX: number,
   castleY: number,
   targetX: number,
   targetY: number,
-  segments: number = 80
+  segments: number = 80,
+  routingData?: RoutingData
 ): { x: number; y: number }[] {
+  if (routingData) {
+    const routed = computeAStarPath(castleX, castleY, targetX, targetY, routingData);
+    if (routed.length >= 2) {
+      return resamplePath(smoothPolyline(routed), segments);
+    }
+  }
+
   const dx = targetX - castleX;
   const dy = targetY - castleY;
 
@@ -138,6 +214,220 @@ export function computePath(
   }
 
   return points;
+}
+
+export function computeObjectivePath(
+  objective: ObjectiveType,
+  line: { territoryX: number; territoryY: number; castleX: number; castleY: number },
+  routingData: RoutingData,
+  laneSeed: number,
+  segments: number = 80
+): { x: number; y: number }[] {
+  let sx = line.castleX;
+  let sy = line.castleY;
+  let tx = line.territoryX;
+  let ty = line.territoryY;
+
+  if (objective === "toCastle") {
+    sx = line.territoryX;
+    sy = line.territoryY;
+    tx = line.castleX;
+    ty = line.castleY;
+  } else if (objective === "toSkirmishMidpoint") {
+    sx = line.territoryX;
+    sy = line.territoryY;
+    tx = (line.castleX + line.territoryX) / 2;
+    ty = (line.castleY + line.territoryY) / 2;
+  }
+
+  const laneRng = seededRandom(Math.abs(laneSeed) + 19);
+  const lane = (laneRng() - 0.5) * routingData.cellSize * 1.15;
+  const vx = tx - sx;
+  const vy = ty - sy;
+  const len = Math.hypot(vx, vy) || 1;
+  const px = -vy / len;
+  const py = vx / len;
+
+  return computePath(
+    sx + px * lane,
+    sy + py * lane,
+    tx + px * lane,
+    ty + py * lane,
+    segments,
+    routingData
+  );
+}
+
+function computeAStarPath(
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+  data: RoutingData
+): { x: number; y: number }[] {
+  const toCell = (x: number, y: number) => ({
+    cx: Math.max(0, Math.min(data.cols - 1, Math.floor(x / data.cellSize))),
+    cy: Math.max(0, Math.min(data.rows - 1, Math.floor(y / data.cellSize))),
+  });
+
+  const start = toCell(startX, startY);
+  const goal = toCell(endX, endY);
+  const startIdx = start.cy * data.cols + start.cx;
+  const goalIdx = goal.cy * data.cols + goal.cx;
+
+  const gScore = new Float32Array(data.cols * data.rows);
+  gScore.fill(Number.POSITIVE_INFINITY);
+  gScore[startIdx] = 0;
+  const cameFrom = new Int32Array(data.cols * data.rows);
+  cameFrom.fill(-1);
+  const openSet = new Set<number>([startIdx]);
+
+  const heuristic = (idx: number) => {
+    const x = idx % data.cols;
+    const y = Math.floor(idx / data.cols);
+    return Math.hypot(x - goal.cx, y - goal.cy);
+  };
+
+  while (openSet.size > 0) {
+    let current = -1;
+    let bestF = Number.POSITIVE_INFINITY;
+    for (const idx of openSet) {
+      const f = gScore[idx] + heuristic(idx);
+      if (f < bestF) {
+        bestF = f;
+        current = idx;
+      }
+    }
+    if (current === goalIdx) break;
+    openSet.delete(current);
+
+    const cx = current % data.cols;
+    const cy = Math.floor(current / data.cols);
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        if (ox === 0 && oy === 0) continue;
+        const nx = cx + ox;
+        const ny = cy + oy;
+        if (nx < 0 || ny < 0 || nx >= data.cols || ny >= data.rows) continue;
+        const nIdx = ny * data.cols + nx;
+        const cellCost = data.costs[nIdx];
+        if (!Number.isFinite(cellCost)) continue;
+        const step = (ox !== 0 && oy !== 0 ? 1.42 : 1) * cellCost;
+        const tentative = gScore[current] + step;
+        if (tentative < gScore[nIdx]) {
+          cameFrom[nIdx] = current;
+          gScore[nIdx] = tentative;
+          openSet.add(nIdx);
+        }
+      }
+    }
+  }
+
+  if (cameFrom[goalIdx] === -1) return [];
+
+  const reverse: number[] = [goalIdx];
+  let cur = goalIdx;
+  while (cur !== startIdx) {
+    cur = cameFrom[cur];
+    if (cur === -1) break;
+    reverse.push(cur);
+  }
+  reverse.reverse();
+
+  return reverse.map((idx) => ({
+    x: (idx % data.cols) * data.cellSize + data.cellSize * 0.5,
+    y: Math.floor(idx / data.cols) * data.cellSize + data.cellSize * 0.5,
+  }));
+}
+
+function resamplePath(points: { x: number; y: number }[], segments: number): { x: number; y: number }[] {
+  if (points.length < 2) return points;
+  const cumulative: number[] = [0];
+  for (let i = 1; i < points.length; i++) {
+    const d = Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    cumulative.push(cumulative[cumulative.length - 1] + d);
+  }
+  const total = cumulative[cumulative.length - 1] || 1;
+  const out: { x: number; y: number }[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = (i / segments) * total;
+    let k = 1;
+    while (k < cumulative.length && cumulative[k] < t) k++;
+    const k0 = Math.max(0, k - 1);
+    const k1 = Math.min(points.length - 1, k);
+    const d0 = cumulative[k0];
+    const d1 = cumulative[k1] || d0 + 1;
+    const lt = d1 === d0 ? 0 : (t - d0) / (d1 - d0);
+    out.push({
+      x: points[k0].x + (points[k1].x - points[k0].x) * lt,
+      y: points[k0].y + (points[k1].y - points[k0].y) * lt,
+    });
+  }
+  return out;
+}
+
+function smoothPolyline(points: { x: number; y: number }[]): { x: number; y: number }[] {
+  if (points.length < 3) return points;
+  const smoothed: { x: number; y: number }[] = [points[0]];
+  for (let i = 1; i < points.length - 1; i++) {
+    smoothed.push({
+      x: (points[i - 1].x + points[i].x * 4 + points[i + 1].x) / 6,
+      y: (points[i - 1].y + points[i].y * 4 + points[i + 1].y) / 6,
+    });
+  }
+  smoothed.push(points[points.length - 1]);
+  return smoothed;
+}
+
+function generateLakes(territories: Territory[], dim: MapDimensions): LakeObstacle[] {
+  const seed = hashString(`lakes|${territories.map((t) => t.id).join("|")}|${Math.round(dim.width)}`);
+  const rng = seededRandom(seed);
+  const occupied = [
+    { x: dim.castleX, y: dim.castleY, r: 120 },
+    ...territories.map((t) => ({ x: t.x, y: t.y, r: 78 })),
+  ];
+  const lakes: LakeObstacle[] = [];
+  const target = 1 + Math.floor(rng() * 4);
+  let guard = 0;
+  while (lakes.length < target && guard < target * 40) {
+    guard++;
+    const x = rng() * dim.width;
+    const y = rng() * dim.height;
+    const radius = 20 + rng() * 34;
+    if (occupied.some((o) => Math.hypot(x - o.x, y - o.y) < o.r + radius)) continue;
+    lakes.push({ x, y, radius, wobble: 0.08 + rng() * 0.1 });
+  }
+  return lakes;
+}
+
+
+function smoothNoise2d(x: number, y: number, seed: number): number {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const x1 = x0 + 1;
+  const y1 = y0 + 1;
+  const sx = x - x0;
+  const sy = y - y0;
+  const n00 = valueNoise(x0, y0, seed);
+  const n10 = valueNoise(x1, y0, seed);
+  const n01 = valueNoise(x0, y1, seed);
+  const n11 = valueNoise(x1, y1, seed);
+  const ix0 = lerp(n00, n10, smoothstep(sx));
+  const ix1 = lerp(n01, n11, smoothstep(sx));
+  return lerp(ix0, ix1, smoothstep(sy));
+}
+
+function valueNoise(x: number, y: number, seed: number): number {
+  const n = Math.sin((x * 127.1 + y * 311.7 + seed * 0.017) * 12.9898) * 43758.5453;
+  return (n - Math.floor(n)) * 2 - 1;
+}
+
+function smoothstep(t: number): number {
+  return t * t * (3 - 2 * t);
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
 function cubicBezier(t: number, p0: number, p1: number, p2: number, p3: number): number {

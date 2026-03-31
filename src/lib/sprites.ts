@@ -391,106 +391,101 @@ export function generateCatapultFrames(): SpriteFrames {
   return { frames, width: w, height: h };
 }
 
+/**
+ * Battering ram + two full-scale troops (same stick size as marching: s=8, h=26).
+ * Ram drawn between walkers; troops use marching-like bob and stride.
+ */
 export function generateBatteringRamFrames(): SpriteFrames {
-  const w = 56, h = 30;
+  const w = 100,
+    h = 26;
   const frames: HTMLCanvasElement[] = [];
+  const groundY = h - 2;
 
   for (let i = 0; i < 6; i++) {
     const [canvas, ctx] = createCanvas(w, h);
     const phase = (i / 6) * Math.PI * 2;
+    const roll = phase * 1.2;
 
-    // Ram swings back and forth
-    const swingOffset = Math.sin(phase) * 4;
+    const leftPhase = phase;
+    const rightPhase = phase + Math.PI;
+    const bobL = -Math.abs(Math.sin(leftPhase)) * 2;
+    const bobR = -Math.abs(Math.sin(rightPhase)) * 2;
+    const legL = 0.35 + 0.35 * Math.sin(leftPhase);
+    const legR = 0.35 + 0.35 * Math.sin(rightPhase);
+    const armL = Math.sin(leftPhase) * 0.6;
+    const armR = Math.sin(rightPhase) * 0.6;
 
-    // Roof structure — wooden shelter over the carriers
-    ctx.fillStyle = "#7B5226";
-    ctx.strokeStyle = "#4a2e18";
-    ctx.lineWidth = 1;
-    // Roof beams (A-frame)
-    ctx.beginPath();
-    ctx.moveTo(6, 4);
-    ctx.lineTo(28, 1);
-    ctx.lineTo(50, 4);
-    ctx.lineTo(50, 7);
-    ctx.lineTo(6, 7);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
+    const swing = Math.sin(phase) * 1.2;
 
-    // Side supports
-    ctx.lineWidth = 1.5;
-    ctx.strokeStyle = "#5a3a18";
-    ctx.beginPath();
-    ctx.moveTo(10, 7);
-    ctx.lineTo(10, 18);
-    ctx.moveTo(46, 7);
-    ctx.lineTo(46, 18);
-    ctx.moveTo(28, 7);
-    ctx.lineTo(28, 16);
-    ctx.stroke();
+    // --- Ram (center, behind troops) ---
+    const wheelR = 3.5;
+    const wl = 40;
+    const wr = 60;
+    const wheelY = groundY - wheelR;
 
-    // Hanging chains/ropes
-    ctx.strokeStyle = "#666";
-    ctx.lineWidth = 0.7;
-    for (const cx of [16, 28, 40]) {
+    ctx.strokeStyle = "#4a3018";
+    ctx.lineWidth = 1.2;
+    for (const wx of [wl, wr]) {
       ctx.beginPath();
-      ctx.moveTo(cx, 7);
-      ctx.lineTo(cx + swingOffset * 0.3, 11);
+      ctx.arc(wx, wheelY, wheelR, 0, Math.PI * 2);
       ctx.stroke();
-    }
-
-    // Ram log — suspended, swinging
-    ctx.fillStyle = "#5B3216";
-    ctx.strokeStyle = "#3a1e0a";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(10 + swingOffset, 11, 34, 5, 2);
-    ctx.fill();
-    ctx.stroke();
-
-    // Metal bands on the log
-    ctx.fillStyle = "#777";
-    ctx.fillRect(18 + swingOffset, 11, 2, 5);
-    ctx.fillRect(30 + swingOffset, 11, 2, 5);
-
-    // Ram head (metal tip with ram face)
-    ctx.fillStyle = "#999";
-    ctx.beginPath();
-    ctx.moveTo(44 + swingOffset, 10);
-    ctx.lineTo(50 + swingOffset, 13.5);
-    ctx.lineTo(44 + swingOffset, 17);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = "#555";
-    ctx.lineWidth = 0.8;
-    ctx.stroke();
-
-    // Carriers (4 stick figures marching underneath)
-    for (let j = 0; j < 4; j++) {
-      const fx = 12 + j * 10;
-      const legPhase = phase + j * 0.6;
-      const bobY = -Math.abs(Math.sin(legPhase)) * 1;
-      drawStickFigure(ctx, fx, h - 2 + bobY, 0.9, 0.4 + 0.2 * Math.sin(legPhase), "#2c1810", 0.55);
-    }
-
-    // Wheels
-    ctx.strokeStyle = "#4a2e18";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(12, h - 1, 3, 0, Math.PI * 2);
-    ctx.arc(44, h - 1, 3, 0, Math.PI * 2);
-    ctx.stroke();
-    // Spokes
-    ctx.lineWidth = 0.5;
-    for (const wx of [12, 44]) {
+      ctx.lineWidth = 0.65;
       for (let sp = 0; sp < 4; sp++) {
-        const a = phase + (sp / 4) * Math.PI * 2;
+        const a = roll + (sp / 4) * Math.PI * 2;
         ctx.beginPath();
-        ctx.moveTo(wx, h - 1);
-        ctx.lineTo(wx + Math.cos(a) * 2.5, h - 1 + Math.sin(a) * 2.5);
+        ctx.moveTo(wx, wheelY);
+        ctx.lineTo(wx + Math.cos(a) * (wheelR - 0.5), wheelY + Math.sin(a) * (wheelR - 0.5));
         ctx.stroke();
       }
+      ctx.lineWidth = 1.2;
     }
+
+    ctx.fillStyle = "#6b4a28";
+    ctx.strokeStyle = "#3d2810";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(34, wheelY - 9, 32, 5, 1);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = "#4a2810";
+    ctx.strokeStyle = "#2a1408";
+    ctx.beginPath();
+    ctx.roundRect(36 + swing * 0.25, wheelY - 15, 28, 6, 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#777";
+    ctx.fillRect(42 + swing * 0.25, wheelY - 15, 2, 6);
+    ctx.fillRect(54 + swing * 0.25, wheelY - 15, 2, 6);
+
+    ctx.fillStyle = "#b0b0b0";
+    ctx.strokeStyle = "#555";
+    ctx.lineWidth = 0.9;
+    ctx.beginPath();
+    ctx.moveTo(62 + swing, wheelY - 16);
+    ctx.lineTo(74 + swing, wheelY - 12);
+    ctx.lineTo(62 + swing, wheelY - 8);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Ropes to hands (after figures for clarity — draw now under troops? Actually under)
+    ctx.strokeStyle = "rgba(55, 40, 25, 0.75)";
+    ctx.lineWidth = 0.85;
+    ctx.setLineDash([2, 1]);
+    ctx.beginPath();
+    ctx.moveTo(38 + swing * 0.25, wheelY - 11);
+    ctx.lineTo(14, groundY - 10 + bobL);
+    ctx.moveTo(62 + swing * 0.25, wheelY - 11);
+    ctx.lineTo(w - 14, groundY - 10 + bobR);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // --- Two troops: full scale (size 1 = same as marching stick figures) ---
+    const lx = 10;
+    const rx = w - 10;
+    drawStickFigure(ctx, lx, groundY + bobL, armL + 0.25, legL, "#2c1810", 1);
+    drawStickFigure(ctx, rx, groundY + bobR, armR - 0.25, legR, "#2c1810", 1);
 
     frames.push(canvas);
   }
@@ -690,11 +685,21 @@ export function generateCastleSprite(name: string, isPlayer: boolean): HTMLCanva
   ctx.closePath();
   ctx.fill();
 
-  // Name label
+  // Name label (supports multi-line names like "BOYSABIO's\\nKingdom")
+  const lines = name.split("\n").map((line) => line.trim()).filter(Boolean);
+  const displayLines = lines.length > 0 ? lines : [name];
+  const longestLine = displayLines.reduce((max, line) => Math.max(max, line.length), 1);
+  const fontSize = Math.max(9, Math.min(13, Math.floor(120 / longestLine)));
+  const lineHeight = Math.max(9, Math.floor(fontSize * 0.92));
+  const totalHeight = lineHeight * displayLines.length;
+  const startY = 65 - totalHeight + lineHeight;
+
   ctx.fillStyle = "#2c1810";
-  ctx.font = `bold ${Math.min(10, 80 / name.length)}px Georgia, serif`;
+  ctx.font = `bold ${fontSize}px Georgia, serif`;
   ctx.textAlign = "center";
-  ctx.fillText(name, 40, 68);
+  for (let i = 0; i < displayLines.length; i++) {
+    ctx.fillText(displayLines[i], 40, startY + i * lineHeight);
+  }
 
   return canvas;
 }
@@ -1077,6 +1082,303 @@ export function generateDragonFrames(): SpriteFrames {
     ctx.moveTo(cx + 1, cy + bob + 11 - legDangle);
     ctx.lineTo(cx + 3, cy + bob + 13 - legDangle);
     ctx.stroke();
+
+    frames.push(canvas);
+  }
+
+  return { frames, width: w, height: h };
+}
+
+/**
+ * Camp rest / sleep — side-lying pose (no duplicate fire; camp site draws the fire).
+ * Gentle breathing + occasional shift reads clearly as asleep.
+ */
+export function generateRestingFrames(): SpriteFrames {
+  const w = 30,
+    h = 16;
+  const frames: HTMLCanvasElement[] = [];
+
+  for (let i = 0; i < 8; i++) {
+    const [canvas, ctx] = createCanvas(w, h);
+    const phase = (i / 8) * Math.PI * 2;
+    const breathe = Math.sin(phase * 0.5) * 0.35;
+    const sleepShift = Math.sin(phase * 0.25) * 0.4;
+
+    const groundY = h - 2;
+    const hx = 9 + sleepShift;
+    const hy = groundY - 4 + breathe;
+
+    ctx.strokeStyle = "#3a2818";
+    ctx.fillStyle = "#3a2818";
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = "round";
+
+    // Rolled bedroll / cloak under head
+    ctx.fillStyle = "rgba(90, 70, 50, 0.85)";
+    ctx.beginPath();
+    ctx.ellipse(hx - 2, hy + 2, 5, 2.2, -0.15, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#3a2818";
+    // Head (profile toward +x)
+    ctx.beginPath();
+    ctx.arc(hx, hy, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+    // Closed eye — short line
+    ctx.strokeStyle = "#2a1810";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(hx + 0.5, hy - 0.5);
+    ctx.lineTo(hx + 2.2, hy - 0.3);
+    ctx.stroke();
+
+    ctx.strokeStyle = "#3a2818";
+    ctx.lineWidth = 1.4;
+    // Torso (horizontal)
+    ctx.beginPath();
+    ctx.moveTo(hx + 2.5, hy + 1);
+    ctx.lineTo(hx + 16 + breathe * 0.2, hy + 0.5 + breathe * 0.15);
+    ctx.stroke();
+
+    // Near arm draped on body
+    ctx.beginPath();
+    ctx.moveTo(hx + 4, hy + 0.5);
+    ctx.quadraticCurveTo(hx + 8, hy + 3, hx + 12, hy + 2);
+    ctx.stroke();
+
+    // Legs (bent, relaxed)
+    ctx.beginPath();
+    ctx.moveTo(hx + 15, hy + 1);
+    ctx.lineTo(hx + 22, hy + 3);
+    ctx.lineTo(hx + 26, groundY);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(hx + 14, hy + 2);
+    ctx.lineTo(hx + 20, hy + 4);
+    ctx.lineTo(hx + 24, groundY);
+    ctx.stroke();
+
+    // Ground shadow
+    ctx.fillStyle = "rgba(35, 28, 20, 0.22)";
+    ctx.beginPath();
+    ctx.ellipse(hx + 10, groundY + 1, 12, 2.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    frames.push(canvas);
+  }
+
+  return { frames, width: w, height: h };
+}
+
+/** Victory — hops, raised arms, small sparkles */
+export function generateCelebratingFrames(): SpriteFrames {
+  const w = 26,
+    h = 32;
+  const frames: HTMLCanvasElement[] = [];
+
+  for (let i = 0; i < 8; i++) {
+    const [canvas, ctx] = createCanvas(w, h);
+    const phase = (i / 8) * Math.PI * 2;
+    const cx = w / 2;
+    const baseY = h - 2;
+    const s = 8;
+    const hop = Math.abs(Math.sin(phase)) * 4;
+    const sway = Math.sin(phase * 2) * 1.5;
+
+    ctx.strokeStyle = "#2c1810";
+    ctx.fillStyle = "#2c1810";
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = "round";
+
+    ctx.beginPath();
+    ctx.arc(cx + sway, baseY - s * 1.85 - hop, s * 0.36, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + sway, baseY - s * 1.45 - hop);
+    ctx.lineTo(cx + sway, baseY - s * 0.48 - hop);
+    ctx.stroke();
+
+    const cheer = Math.sin(phase) * 0.55;
+    ctx.beginPath();
+    ctx.moveTo(cx + sway, baseY - s * 1.25 - hop);
+    ctx.lineTo(cx + sway - s * 0.85, baseY - s * 1.85 - hop - cheer * 5);
+    ctx.moveTo(cx + sway, baseY - s * 1.25 - hop);
+    ctx.lineTo(cx + sway + s * 0.85, baseY - s * 1.85 - hop - cheer * 5);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + sway - s * 0.35, baseY - hop);
+    ctx.lineTo(cx + sway, baseY - s * 0.5 - hop);
+    ctx.lineTo(cx + sway + s * 0.35, baseY - hop);
+    ctx.stroke();
+
+    for (let sp = 0; sp < 4; sp++) {
+      const a = (sp / 4) * Math.PI * 2 + phase;
+      const pr = 12 + sp * 3;
+      ctx.fillStyle = `rgba(255, 210, 80, ${0.35 + 0.2 * Math.sin(phase + sp)})`;
+      ctx.beginPath();
+      ctx.arc(cx + Math.cos(a) * pr, baseY - s * 2.2 - hop + Math.sin(a) * pr * 0.3, 1.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    frames.push(canvas);
+  }
+
+  return { frames, width: w, height: h };
+}
+
+/** Wounded retreat — bandage, blood smear, heavy limp, muted palette */
+export function generateRetreatingFrames(): SpriteFrames {
+  const w = 22,
+    h = 28;
+  const frames: HTMLCanvasElement[] = [];
+  const skin = "#4a3028";
+  const cloth = "#3d2820";
+  const blood = "rgba(120, 25, 25, 0.75)";
+  const bandage = "#d4c4a8";
+
+  for (let i = 0; i < 8; i++) {
+    const [canvas, ctx] = createCanvas(w, h);
+    const phase = (i / 8) * Math.PI * 2;
+    const cx = w / 2;
+    const baseY = h - 1;
+    const s = 8;
+    const lean = Math.sin(phase) * 0.22;
+    const stagger = Math.sin(phase * 2) * 0.9;
+    const headY = baseY - s * 1.78 + stagger;
+
+    ctx.fillStyle = blood;
+    ctx.beginPath();
+    ctx.ellipse(cx + lean * 4 + 3, baseY - s * 0.3, 4, 2, 0.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = cloth;
+    ctx.fillStyle = skin;
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = "round";
+
+    ctx.beginPath();
+    ctx.arc(cx + lean * 4 + stagger * 0.3, headY, s * 0.33, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = bandage;
+    ctx.fillRect(cx + lean * 4 - 4 + stagger * 0.3, headY - 4, 8, 3);
+
+    ctx.strokeStyle = cloth;
+    ctx.beginPath();
+    ctx.moveTo(cx + lean * 4 + stagger * 0.3, headY + s * 0.35);
+    ctx.lineTo(cx + lean * 3 + stagger, baseY - s * 0.42);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + lean * 3 + stagger, baseY - s * 1.05);
+    ctx.lineTo(cx + lean * 2.2 + stagger - s * 0.5, baseY - s * 0.82);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(cx + lean * 3 + stagger, baseY - s * 1.05);
+    ctx.lineTo(cx + lean * 2.8 + stagger + s * 0.35, baseY - s * 0.88);
+    ctx.stroke();
+
+    const limp = Math.sin(phase * 2) * 0.5;
+    ctx.beginPath();
+    ctx.moveTo(cx + lean * 2 - s * 0.35 + limp, baseY);
+    ctx.lineTo(cx + lean * 3 + stagger, baseY - s * 0.45);
+    ctx.lineTo(cx + lean * 2 + s * 0.42 - limp, baseY + 1);
+    ctx.stroke();
+
+    ctx.fillStyle = blood;
+    ctx.globalAlpha = 0.45;
+    ctx.beginPath();
+    ctx.moveTo(cx + lean * 2 + 2, baseY - s * 0.5);
+    ctx.lineTo(cx + lean * 3 + 5, baseY - s * 0.2);
+    ctx.lineTo(cx + lean * 2 + 4, baseY + 1);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    frames.push(canvas);
+  }
+
+  return { frames, width: w, height: h };
+}
+
+/** Progressive camp: stakes → tent → bedrolls → fire — draw centered on anchor */
+export function generateCampSiteFrames(): SpriteFrames {
+  const w = 56,
+    h = 40;
+  const frames: HTMLCanvasElement[] = [];
+
+  for (let fi = 0; fi < 8; fi++) {
+    const [canvas, ctx] = createCanvas(w, h);
+    const cx = w / 2;
+    const groundY = h - 6;
+    const p = (fi + 1) / 8;
+
+    ctx.fillStyle = "rgba(45, 38, 28, 0.25)";
+    ctx.beginPath();
+    ctx.ellipse(cx, groundY + 2, 22, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = "#5c4a32";
+    ctx.lineWidth = 1.2;
+    for (let s = 0; s < 4; s++) {
+      const ang = (s / 4) * Math.PI * 2 + 0.2;
+      const len = 4 + fi * 0.5;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(ang) * 10, groundY - 2 + Math.sin(ang) * 3);
+      ctx.lineTo(
+        cx + Math.cos(ang) * (10 + len),
+        groundY - 2 + Math.sin(ang) * 3 - len * 0.4
+      );
+      ctx.stroke();
+    }
+
+    if (fi >= 2) {
+      ctx.fillStyle = `rgba(90, 70, 45, ${0.35 + p * 0.25})`;
+      ctx.beginPath();
+      ctx.moveTo(cx - 14, groundY);
+      ctx.lineTo(cx, groundY - 14 - fi * 0.4);
+      ctx.lineTo(cx + 14, groundY);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "#4a3828";
+      ctx.stroke();
+    }
+
+    if (fi >= 4) {
+      ctx.fillStyle = "rgba(70, 55, 38, 0.9)";
+      ctx.fillRect(cx - 10, groundY - 4, 20, 5);
+      ctx.strokeStyle = "#3a2818";
+      ctx.strokeRect(cx - 10, groundY - 4, 20, 5);
+    }
+
+    if (fi >= 5) {
+      ctx.fillStyle = "rgba(55, 45, 32, 0.85)";
+      ctx.beginPath();
+      ctx.ellipse(cx - 8, groundY - 2, 5, 2.5, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx + 8, groundY - 2, 5, 2.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (fi >= 6) {
+      const pulse = 0.4 + Math.sin(fi * 0.8) * 0.15;
+      const g = ctx.createRadialGradient(cx, groundY - 6, 0, cx, groundY - 6, 10);
+      g.addColorStop(0, `rgba(255, 140, 40, ${pulse})`);
+      g.addColorStop(0.6, `rgba(200, 60, 20, ${pulse * 0.5})`);
+      g.addColorStop(1, "rgba(80, 30, 10, 0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(cx, groundY - 6, 10, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(60, 40, 20, 0.6)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(cx, groundY - 6, 6, 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     frames.push(canvas);
   }

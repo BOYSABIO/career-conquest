@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { fileURLToPath } from "url";
 
 interface Application {
   company: string;
@@ -17,8 +18,9 @@ const POSITIONS_DIR = path.join(ROOT, "Applications", "Positions");
 const MASTER_LIST = path.join(ROOT, "MASTER_APP_LIST.md");
 const OUTPUT_DIR = path.join(__dirname, "..", "public", "data");
 const OUTPUT_FILE = path.join(OUTPUT_DIR, "applications.json");
+const STRICT_PARSE = process.env.PARSE_STRICT === "1";
 
-function parseStatusTag(raw: string): Application["status"] {
+export function parseStatusTag(raw: string): Application["status"] {
   const lower = raw.toLowerCase().replace("#", "").trim();
   if (lower.includes("reject")) return "reject";
   if (lower.includes("interview")) return "interview";
@@ -57,11 +59,10 @@ function parsePositionFile(
   }
 }
 
-function parseMasterList(): Map<
+export function parseMasterListContent(content: string): Map<
   string,
   { company: string; category: "company" | "startup"; masterStatus?: string }
 > {
-  const content = fs.readFileSync(MASTER_LIST, "utf-8");
   const lines = content.split("\n");
 
   const positionToCompany = new Map<
@@ -113,6 +114,14 @@ function parseMasterList(): Map<
   return positionToCompany;
 }
 
+function parseMasterList(): Map<
+  string,
+  { company: string; category: "company" | "startup"; masterStatus?: string }
+> {
+  const content = fs.readFileSync(MASTER_LIST, "utf-8");
+  return parseMasterListContent(content);
+}
+
 function detectStartups(): Set<string> {
   const startupDir = path.join(ROOT, "Applications", "Startups");
   if (!fs.existsSync(startupDir)) return new Set();
@@ -122,6 +131,35 @@ function detectStartups(): Set<string> {
 }
 
 function main() {
+  const hasPositions = fs.existsSync(POSITIONS_DIR);
+  const hasMasterList = fs.existsSync(MASTER_LIST);
+
+  if (!hasPositions || !hasMasterList) {
+    if (fs.existsSync(OUTPUT_FILE) && !STRICT_PARSE) {
+      console.warn(
+        [
+          "Skipping parse: source vault files were not found.",
+          `Expected positions dir: ${POSITIONS_DIR}`,
+          `Expected master list: ${MASTER_LIST}`,
+          `Using existing data file: ${OUTPUT_FILE}`,
+          "Set VAULT_PATH to parse from your applications vault, or PARSE_STRICT=1 to fail hard.",
+        ].join("\n")
+      );
+      return;
+    }
+
+    throw new Error(
+      [
+        "Parse input not found and no fallback data available.",
+        `Missing positions dir: ${POSITIONS_DIR}`,
+        `Missing master list: ${MASTER_LIST}`,
+        `Missing output file: ${OUTPUT_FILE}`,
+        "Provide VAULT_PATH or commit public/data/applications.json.",
+      ].join("\n")
+    );
+  }
+
+  console.log(`Parsing applications from: ${ROOT}`);
   const masterMap = parseMasterList();
   const startups = detectStartups();
 
@@ -158,7 +196,7 @@ function main() {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(applications, null, 2));
 
-  console.log(`Parsed ${applications.length} applications`);
+  console.log(`Parsed ${applications.length} applications from vault source`);
   console.log(`Output: ${OUTPUT_FILE}`);
 
   const stats = {
@@ -171,4 +209,10 @@ function main() {
   console.log("Stats:", stats);
 }
 
-main();
+const isDirectRun =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isDirectRun) {
+  main();
+}

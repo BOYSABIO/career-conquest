@@ -7,7 +7,8 @@
     "build": "npm run parse && next build",
     "start": "next start",
     "lint": "next lint",
-    "parse": "tsx scripts/parse-applications.ts"
+    "parse": "tsx scripts/parse-applications.ts",
+    "test:parser": "node --import tsx --test scripts/parse-applications.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",

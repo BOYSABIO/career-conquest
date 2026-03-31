@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { GuestMessage } from "@/lib/types";
-import { getSupabase, isSupabaseConfigured } from "@/lib/supabase";
+import { getSupabase } from "@/lib/supabase";
+import { classifyMessageImpact } from "@/lib/battle/interaction";
 
 export function useRealtimeMessages() {
   const [messages, setMessages] = useState<GuestMessage[]>([]);
@@ -49,7 +50,7 @@ export function useRealtimeMessages() {
           // Trigger canvas animation
           const trigger = (window as any).__battleMapTriggerEffect;
           if (trigger) {
-            trigger(newMsg.type === "roast" ? "catapult" : "ram");
+            trigger(classifyMessageImpact(newMsg.text, newMsg.type));
           }
         }
       )
@@ -93,7 +94,7 @@ export function useRealtimeMessages() {
         // Trigger canvas animation locally
         const trigger = (window as any).__battleMapTriggerEffect;
         if (trigger) {
-          trigger(type === "roast" ? "catapult" : "ram");
+          trigger(classifyMessageImpact(text, type));
         }
       }
     },
