@@ -4,6 +4,8 @@ import { MapStats } from "./BattleMap";
 
 interface HUDProps {
   stats: MapStats;
+  /** Total job applications (rows); territories = unique companies */
+  applicationCount: number;
   encouragements: number;
   roasts: number;
   spectators: number;
@@ -18,8 +20,18 @@ function getMoraleLabel(encouragements: number, roasts: number): { label: string
   return { label: "Cooked (but fighting)", color: "#ef4444" };
 }
 
-export default function HUD({ stats, encouragements, roasts, spectators }: HUDProps) {
+export default function HUD({
+  stats,
+  applicationCount,
+  encouragements,
+  roasts,
+  spectators,
+}: HUDProps) {
   const morale = getMoraleLabel(encouragements, roasts);
+
+  const fitMap = () => {
+    (window as unknown as { __battleMapFitAll?: () => void }).__battleMapFitAll?.();
+  };
 
   return (
     <div className="absolute top-0 left-0 right-0 z-10 pointer-events-none">
@@ -44,6 +56,7 @@ export default function HUD({ stats, encouragements, roasts, spectators }: HUDPr
 
       {/* Stats Bar */}
       <div className="flex justify-center gap-1 md:gap-3 px-2 mt-2 flex-wrap">
+        <StatBox label="Applications" value={applicationCount} icon="📋" />
         <StatBox label="Territories" value={stats.total} icon="🏰" />
         <StatBox label="Active Sieges" value={stats.active} icon="⚔️" />
         <StatBox label="Fallen" value={stats.fallen} icon="☠️" color="#8b0000" />
@@ -65,6 +78,22 @@ export default function HUD({ stats, encouragements, roasts, spectators }: HUDPr
         <span>
           Catapult strikes: <strong className="text-red-400">{roasts}</strong>
         </span>
+      </div>
+
+      <div className="absolute bottom-4 right-4 pointer-events-auto">
+        <button
+          type="button"
+          onClick={fitMap}
+          className="px-3 py-1.5 rounded-md text-xs font-medium shadow-md"
+          style={{
+            background: "rgba(44, 24, 16, 0.92)",
+            border: "1px solid rgba(139, 115, 85, 0.55)",
+            color: "#f4e4c1",
+          }}
+          title="Zoom to show castle and all fortresses"
+        >
+          Fit map
+        </button>
       </div>
     </div>
   );

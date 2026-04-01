@@ -1565,6 +1565,38 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     animFrameRef.current = requestAnimationFrame(render);
   }, []);
 
+  useEffect(() => {
+    (window as unknown as { __battleMapFitAll?: () => void }).__battleMapFitAll = () => {
+      const layout = layoutRef.current;
+      if (!layout) return;
+      const screen = screenRef.current;
+      const pad = 100;
+      let minX = layout.dimensions.castleX - 48;
+      let maxX = layout.dimensions.castleX + 48;
+      let minY = layout.dimensions.castleY - 48;
+      let maxY = layout.dimensions.castleY + 48;
+      for (const t of layout.territories) {
+        minX = Math.min(minX, t.x - 55);
+        maxX = Math.max(maxX, t.x + 55);
+        minY = Math.min(minY, t.y - 48);
+        maxY = Math.max(maxY, t.y + 48);
+      }
+      const worldW = maxX - minX + pad * 2;
+      const worldH = maxY - minY + pad * 2;
+      const zoomX = screen.w / worldW;
+      const zoomY = screen.h / worldH;
+      const cam = cameraRef.current;
+      cam.zoom = Math.max(0.12, Math.min(1.5, Math.min(zoomX, zoomY) * 0.92));
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      cam.x = cx - screen.w / (2 * cam.zoom);
+      cam.y = cy - screen.h / (2 * cam.zoom);
+    };
+    return () => {
+      delete (window as unknown as { __battleMapFitAll?: () => void }).__battleMapFitAll;
+    };
+  }, []);
+
   // Expose effect trigger
   useEffect(() => {
     (window as any).__battleMapTriggerEffect = (

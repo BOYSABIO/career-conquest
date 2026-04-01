@@ -36,53 +36,52 @@ export function computeMapLayout(
     companyMap.set(app.company, existing);
   }
 
-  const companies = Array.from(companyMap.entries());
+  const companies = Array.from(companyMap.entries()).sort((a, b) =>
+    a[0].localeCompare(b[0], undefined, { sensitivity: "base" })
+  );
   const count = companies.length;
 
-  // World size grows with territory count — generous spacing
-  const baseRadius = 600;
-  const worldRadius = baseRadius + count * 50;
-  const worldSize = worldRadius * 2 + 300;
+  // Placement arena: grows with territory count (final canvas size is derived from content below).
+  const baseRadius = 820;
+  const worldRadius = baseRadius + count * 88;
+  const placeMargin = Math.max(520, Math.round(worldRadius * 0.5));
+  const placeSize = worldRadius * 2 + placeMargin;
 
-  const castleX = worldSize / 2;
-  const castleY = worldSize / 2;
+  const castleX = placeSize / 2;
+  const castleY = placeSize / 2;
 
-  const MIN_DIST = 200;
-  const MIN_CASTLE_DIST = 250;
+  const MIN_DIST = 330;
+  const MIN_CASTLE_DIST = 380;
+  const TERRITORY_AREA_BASE = 235;
 
   const placed: { x: number; y: number }[] = [];
 
   const territories: Territory[] = companies.map(([company, apps]) => {
     const seed = hashString(company);
     const rng = seededRandom(seed);
+    // Stable base polar coords per company (same name → same angle/radius draw)
+    let angle = rng() * Math.PI * 2;
+    let dist = MIN_CASTLE_DIST + rng() * (worldRadius - MIN_CASTLE_DIST);
+    let bestX = castleX + Math.cos(angle) * dist;
+    let bestY = castleY + Math.sin(angle) * dist;
 
-    let bestX = castleX;
-    let bestY = castleY;
-    let bestMinDist = 0;
-
-    for (let attempt = 0; attempt < 100; attempt++) {
-      // Place in a ring around the castle
-      const angle = rng() * Math.PI * 2;
-      const dist = MIN_CASTLE_DIST + rng() * (worldRadius - MIN_CASTLE_DIST);
-      const cx = castleX + Math.cos(angle) * dist;
-      const cy = castleY + Math.sin(angle) * dist;
-
-      let minDist = Infinity;
+    // Deterministic collision nudges (depends only on company + attempt + prior placed)
+    for (let attempt = 0; attempt < 60; attempt++) {
+      let minDistToOther = Infinity;
       for (const p of placed) {
-        const d = Math.sqrt((cx - p.x) ** 2 + (cy - p.y) ** 2);
-        minDist = Math.min(minDist, d);
+        const d = Math.hypot(bestX - p.x, bestY - p.y);
+        minDistToOther = Math.min(minDistToOther, d);
       }
-      const cDist = Math.sqrt((cx - castleX) ** 2 + (cy - castleY) ** 2);
-      if (cDist < MIN_CASTLE_DIST) continue;
+      const cDist = Math.hypot(bestX - castleX, bestY - castleY);
+      const okCastle = cDist >= MIN_CASTLE_DIST;
+      const okSep = placed.length === 0 || minDistToOther >= MIN_DIST;
+      if (okCastle && okSep) break;
 
-      if (placed.length === 0) minDist = MIN_DIST + 1;
-
-      if (minDist > bestMinDist) {
-        bestMinDist = minDist;
-        bestX = cx;
-        bestY = cy;
-        if (minDist >= MIN_DIST) break;
-      }
+      const nRng = seededRandom(seed + 7919 + attempt * 97);
+      angle += (nRng() - 0.5) * 1.1;
+      dist = Math.min(worldRadius - 30, dist + 14 + nRng() * 30);
+      bestX = castleX + Math.cos(angle) * dist;
+      bestY = castleY + Math.sin(angle) * dist;
     }
 
     placed.push({ x: bestX, y: bestY });
@@ -106,13 +105,130 @@ export function computeMapLayout(
     };
   });
 
-  const dimensions = { width: worldSize, height: worldSize, castleX, castleY };
+  const territoryAreaRadii = territories.map((t) => {
+    const localRng = seededRandom(hashString(`territory-area|${t.company}`));
+    // Per-company radius adds natural variation while preserving deterministic layout.
+    return TERRITORY_AREA_BASE * (0.9 + localRng() * 0.4);
+  });
+
+  enforceTerritoryAreaSpacing(
+    territories,
+    territoryAreaRadii,
+    castleX,
+    castleY,
+    MIN_CASTLE_DIST,
+    worldRadius - 20
+  );
+
+  const dimensions = fitWorldDimensionsToContent(territories, castleX, castleY);
   const routingData = buildRoutingData(territories, dimensions);
 
   return {
     territories,
     dimensions,
     routingData,
+  };
+}
+
+function enforceTerritoryAreaSpacing(
+  territories: Territory[],
+  territoryAreaRadii: number[],
+  castleX: number,
+  castleY: number,
+  minCastleDist: number,
+  maxCastleDist: number
+): void {
+  if (territories.length < 2) return;
+
+  for (let iter = 0; iter < 12; iter++) {
+    let moved = false;
+
+    for (let i = 0; i < territories.length; i++) {
+      for (let j = i + 1; j < territories.length; j++) {
+        const a = territories[i];
+        const b = territories[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+
+        if (d < 1e-6) {
+          dx = 1;
+          dy = 0;
+          d = 1;
+        }
+
+        const targetSeparation = territoryAreaRadii[i] + territoryAreaRadii[j];
+        if (d >= targetSeparation) continue;
+        const push = (targetSeparation - d) * 0.5;
+        const nx = dx / d;
+        const ny = dy / d;
+
+        a.x -= nx * push;
+        a.y -= ny * push;
+        b.x += nx * push;
+        b.y += ny * push;
+        moved = true;
+      }
+    }
+
+    for (const t of territories) {
+      const vx = t.x - castleX;
+      const vy = t.y - castleY;
+      let dist = Math.hypot(vx, vy);
+      if (dist < 1e-6) dist = 1;
+      const nx = vx / dist;
+      const ny = vy / dist;
+      const clamped = Math.max(minCastleDist, Math.min(maxCastleDist, dist));
+      t.x = castleX + nx * clamped;
+      t.y = castleY + ny * clamped;
+    }
+
+    if (!moved) break;
+  }
+}
+
+/** Tight square world around castle + fortresses; padding scales with spread so the map grows with data, not a fixed pixel size. */
+function fitWorldDimensionsToContent(
+  territories: Territory[],
+  castleX: number,
+  castleY: number
+): MapDimensions {
+  const castlePad = 125;
+  const fortPad = 168;
+
+  let minX = castleX - castlePad;
+  let maxX = castleX + castlePad;
+  let minY = castleY - castlePad;
+  let maxY = castleY + castlePad;
+
+  for (const t of territories) {
+    minX = Math.min(minX, t.x - fortPad);
+    maxX = Math.max(maxX, t.x + fortPad);
+    minY = Math.min(minY, t.y - fortPad);
+    maxY = Math.max(maxY, t.y + fortPad);
+  }
+
+  const spanW = maxX - minX;
+  const spanH = maxY - minY;
+  const span = Math.max(spanW, spanH);
+  const edgePad = Math.max(400, span * 0.15);
+  const worldSize = span + edgePad * 2;
+
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const dx = worldSize / 2 - cx;
+  const dy = worldSize / 2 - cy;
+
+  for (const t of territories) {
+    t.x += dx;
+    t.y += dy;
+  }
+
+  return {
+    width: worldSize,
+    height: worldSize,
+    castleX: castleX + dx,
+    castleY: castleY + dy,
   };
 }
 

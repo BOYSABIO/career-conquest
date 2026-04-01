@@ -44,7 +44,7 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/data/applications.json")
+    fetch("/data/applications.json", { cache: "no-store" })
       .then(async (res) => {
         if (!res.ok) {
           throw new Error(`Failed to load data (${res.status})`);
@@ -136,6 +136,7 @@ export default function Home() {
       {/* HUD Overlay */}
       <HUD
         stats={stats}
+        applicationCount={applications.length}
         encouragements={encouragements}
         roasts={roasts}
         spectators={spectators}
