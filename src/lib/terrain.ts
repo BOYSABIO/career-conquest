@@ -10,6 +10,10 @@ export function renderWorldBackground(
   dimensions: MapDimensions,
   routingData?: RoutingData
 ): HTMLCanvasElement {
+  const start =
+    typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
   const { width: w, height: h } = dimensions;
   const canvas = document.createElement("canvas");
   canvas.width = w;
@@ -24,7 +28,20 @@ export function renderWorldBackground(
   drawHydroFeatures(ctx, dimensions, hydroField);
   drawTerritoryBorders(ctx, territories, dimensions);
   drawMountains(ctx, dimensions, territories.length);
-  drawBiomeProps(ctx, territories, dimensions, biomeField, hydroField);
+  const propMetrics = drawBiomeProps(ctx, territories, dimensions, biomeField, hydroField);
+
+  const end =
+    typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+  if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+    console.debug("[terrain] background render", {
+      ms: Math.round((end - start) * 100) / 100,
+      size: `${Math.round(w)}x${Math.round(h)}`,
+      territories: territories.length,
+      ...propMetrics,
+    });
+  }
 
   return canvas;
 }
@@ -105,6 +122,24 @@ interface ForestBlob {
   y: number;
   radius: number;
   sprite: HTMLCanvasElement;
+}
+
+interface TerrainRenderProfile {
+  densityScale: number;
+  patchCap: number;
+  blobCountBoost: number;
+  blobRadiusScale: number;
+  treeAttemptScale: number;
+  bushAttemptScale: number;
+  rockAttemptScale: number;
+}
+
+interface TerrainRenderMetrics {
+  forestPatches: number;
+  forestBlobs: number;
+  trees: number;
+  bushes: number;
+  rocks: number;
 }
 
 // -- Parchment --
@@ -459,12 +494,13 @@ function drawBiomeProps(
   dim: MapDimensions,
   biomeField: BiomeField,
   hydroField: HydroField
-) {
+): TerrainRenderMetrics {
   const propSeed = hashString(
     `props|${territories.map((t) => t.id).join("|")}|${Math.round(dim.width)}`
   );
   const rng = seededRandom(propSeed);
   const worldRadius = dim.width * 0.45;
+  const renderProfile = getTerrainRenderProfile(dim, territories.length);
 
   const occupied = [
     { x: dim.castleX, y: dim.castleY, r: TERRAIN_TUNING.castleExclusionRadius },
@@ -477,15 +513,21 @@ function drawBiomeProps(
     y2: t.y,
   }));
 
-  const forestPatches = buildForestPatches(dim, biomeField, rng, occupied);
-  const forestBlobs = buildForestBlobs(forestPatches, hydroField, rng);
+  const forestPatches = buildForestPatches(dim, biomeField, rng, occupied, renderProfile);
+  const forestBlobs = buildForestBlobs(forestPatches, hydroField, rng, renderProfile);
   const treePoints: { x: number; y: number }[] = [];
   const bushPoints: { x: number; y: number }[] = [];
   const rockPoints: { x: number; y: number }[] = [];
 
-  const treeAttempts = Math.min(4200, 1200 + territories.length * 110);
-  const bushAttempts = Math.min(2600, 900 + territories.length * 70);
-  const rockAttempts = Math.min(2200, 850 + territories.length * 75);
+  const treeAttempts = Math.floor(
+    Math.min(4200, (1200 + territories.length * 110) * renderProfile.treeAttemptScale)
+  );
+  const bushAttempts = Math.floor(
+    Math.min(2600, (900 + territories.length * 70) * renderProfile.bushAttemptScale)
+  );
+  const rockAttempts = Math.floor(
+    Math.min(2200, (850 + territories.length * 75) * renderProfile.rockAttemptScale)
+  );
 
   for (let i = 0; i < treeAttempts; i++) {
     const x = rng() * dim.width;
@@ -497,8 +539,13 @@ function drawBiomeProps(
     const acceptance = biome === "forest" ? 0.17 + densityBoost * 0.68 : biome === "plains" ? 0.09 : 0.03;
     if (isInsideForestClearing(x, y, forestPatches)) continue;
     if (isInsideForestBlob(x, y, forestBlobs, 0.75)) continue;
-    if (rng() > acceptance) continue;
+    const adjustedAcceptance =
+      biome === "forest"
+        ? Math.min(0.78, acceptance * renderProfile.densityScale)
+        : acceptance;
+    if (rng() > adjustedAcceptance) continue;
     if (!passesMinSpacing(x, y, treePoints, spacing)) continue;
+    if (biome === "forest" && isInsideForestBlob(x, y, forestBlobs, 0.95) && rng() > 0.2) continue;
     treePoints.push({ x, y });
   }
 
@@ -547,16 +594,28 @@ function drawBiomeProps(
     drawSingleRock(ctx, p.x, p.y, 3 + rng() * 5, rng);
   }
   ctx.restore();
+
+  return {
+    forestPatches: forestPatches.length,
+    forestBlobs: forestBlobs.length,
+    trees: treePoints.length,
+    bushes: bushPoints.length,
+    rocks: rockPoints.length,
+  };
 }
 
 function buildForestPatches(
   dim: MapDimensions,
   biomeField: BiomeField,
   rng: () => number,
-  occupied: { x: number; y: number; r: number }[]
+  occupied: { x: number; y: number; r: number }[],
+  renderProfile: TerrainRenderProfile
 ): ForestPatch[] {
   const patches: ForestPatch[] = [];
-  const patchCount = Math.floor(6 + Math.min(18, dim.width / 220));
+  const patchCount = Math.min(
+    renderProfile.patchCap,
+    Math.floor(6 + Math.min(18, dim.width / 220))
+  );
   let guard = 0;
   while (patches.length < patchCount && guard < patchCount * 30) {
     guard++;
@@ -620,7 +679,8 @@ function isInsideForestClearing(
 function buildForestBlobs(
   patches: ForestPatch[],
   hydroField: HydroField,
-  rng: () => number
+  rng: () => number,
+  renderProfile: TerrainRenderProfile
 ): ForestBlob[] {
   const blobs: ForestBlob[] = [];
 
@@ -629,7 +689,11 @@ function buildForestBlobs(
     const targetCount =
       TERRAIN_TUNING.forestBlobCountMin +
       Math.floor(
-        rng() * (TERRAIN_TUNING.forestBlobCountMax - TERRAIN_TUNING.forestBlobCountMin + 1)
+        rng() *
+          (TERRAIN_TUNING.forestBlobCountMax -
+            TERRAIN_TUNING.forestBlobCountMin +
+            1 +
+            renderProfile.blobCountBoost)
       );
 
     let guard = 0;
@@ -640,8 +704,9 @@ function buildForestBlobs(
       const x = patch.x + Math.cos(angle) * dist;
       const y = patch.y + Math.sin(angle) * dist;
       const radius =
-        TERRAIN_TUNING.forestBlobMinRadius +
-        rng() * (TERRAIN_TUNING.forestBlobMaxRadius - TERRAIN_TUNING.forestBlobMinRadius);
+        (TERRAIN_TUNING.forestBlobMinRadius +
+          rng() * (TERRAIN_TUNING.forestBlobMaxRadius - TERRAIN_TUNING.forestBlobMinRadius)) *
+        renderProfile.blobRadiusScale;
 
       if (isPointInPatchClearings(x, y, patch, radius * 0.75)) continue;
       if (hydroField.lakes.some((l) => Math.hypot(x - l.x, y - l.y) < l.radius + radius + TERRAIN_TUNING.forestBlobLakeBuffer)) continue;
@@ -870,6 +935,23 @@ function generateForestBlobSprite(radius: number, seed: number): HTMLCanvasEleme
   }
 
   return canvas;
+}
+
+function getTerrainRenderProfile(dim: MapDimensions, territoryCount: number): TerrainRenderProfile {
+  const worldArea = dim.width * dim.height;
+  const sizeScale = Math.min(1.6, Math.max(0.85, Math.sqrt(worldArea / (2100 * 2100))));
+  const territoryScale = Math.min(1.5, Math.max(0.9, territoryCount / 16));
+  const pressure = Math.max(1, sizeScale * territoryScale);
+
+  return {
+    densityScale: Math.min(1.12, 0.92 + pressure * 0.08),
+    patchCap: Math.max(9, Math.floor(26 / pressure)),
+    blobCountBoost: Math.min(2.4, 0.8 + pressure * 0.8),
+    blobRadiusScale: Math.min(1.4, 1.08 + pressure * 0.08),
+    treeAttemptScale: Math.max(0.56, 0.92 / pressure),
+    bushAttemptScale: Math.max(0.62, 0.9 / pressure),
+    rockAttemptScale: Math.max(0.75, 0.97 / pressure),
+  };
 }
 
 function smoothNoise2d(x: number, y: number, seed: number): number {

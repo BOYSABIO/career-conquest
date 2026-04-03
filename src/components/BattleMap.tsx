@@ -15,6 +15,8 @@ import {
   generateFightingFrames,
   generateCastleSprite,
   generateFortressSprite,
+  FORTRESS_SPRITE_DRAW_DX,
+  FORTRESS_SPRITE_DRAW_DY,
   generateCatapultFrames,
   generateBatteringRamFrames,
   generateFlagBearerFrames,
@@ -27,13 +29,20 @@ import {
   SpriteFrames,
 } from "@/lib/sprites";
 import { BattleImpactEvent } from "@/lib/battle/interaction";
-import { BATTLE_BALANCE, BATTLE_TIMINGS, CAMPAIGN, INTERACTION_BALANCE } from "@/lib/battle/constants";
+import {
+  BATTLE_BALANCE,
+  BATTLE_TIMINGS,
+  CAMPAIGN,
+  INTERACTION_BALANCE,
+} from "@/lib/battle/constants";
 import {
   isActiveSideFormation,
   randomRespawnDelay,
   retreatSucceeded,
   tickRespawnCooldown,
 } from "@/lib/battle/campaign";
+import { hiringWallRingCount } from "@/lib/battle/hiringStages";
+import { keyBearBackground } from "@/lib/spriteChroma";
 
 interface BattleMapProps {
   applications: AppData[];
@@ -130,6 +139,15 @@ interface TroopLine {
   nextSkirmishId: number;
   attackersWiped: boolean;
   defendersWiped: boolean;
+}
+
+/** Copilot bear bitmaps patrolling a lane (ping-pong on path). */
+interface LaneBearPatrol {
+  lineIndex: number;
+  t: number;
+  speed: number;
+  alongDir: 1 | -1;
+  phase: number;
 }
 
 interface LiveEffect {
@@ -250,6 +268,45 @@ function resolveObjectivePath(
   return line.path;
 }
 
+/** Smooth position along polyline (linear interp between vertices). Cheap: O(1). */
+function interpolateAlongRoute(route: { x: number; y: number }[], t: number): { x: number; y: number } {
+  if (route.length < 2) return route[0] ?? { x: 0, y: 0 };
+  const pathLen = route.length - 1;
+  const clampedT = Math.max(0, Math.min(1, t));
+  const floatPos = clampedT * pathLen;
+  const i0 = Math.min(Math.floor(floatPos), pathLen - 1);
+  const frac = floatPos - i0;
+  const i1 = Math.min(i0 + 1, pathLen);
+  const p0 = route[i0];
+  const p1 = route[i1];
+  return {
+    x: p0.x + (p1.x - p0.x) * frac,
+    y: p0.y + (p1.y - p0.y) * frac,
+  };
+}
+
+/** Unit tangent on the polyline at t in [0,1] (for patrol facing). */
+function routeDirectionAtT(route: { x: number; y: number }[], t: number): { dx: number; dy: number } {
+  if (route.length < 2) return { dx: 1, dy: 0 };
+  const delta = 0.005;
+  const t0 = Math.max(0, t - delta);
+  const t1 = Math.min(1, t + delta);
+  const p0 = interpolateAlongRoute(route, t0);
+  const p1 = interpolateAlongRoute(route, t1);
+  let dx = p1.x - p0.x;
+  let dy = p1.y - p0.y;
+  if (dx * dx + dy * dy < 1e-6) {
+    const pathLen = route.length - 1;
+    const floatPos = Math.max(0, Math.min(1, t)) * pathLen;
+    const i0 = Math.min(Math.floor(floatPos), pathLen - 1);
+    const i1 = Math.min(i0 + 1, pathLen);
+    dx = route[i1].x - route[i0].x;
+    dy = route[i1].y - route[i0].y;
+  }
+  const len = Math.hypot(dx, dy) || 1;
+  return { dx: dx / len, dy: dy / len };
+}
+
 function formationPosition(formation: Formation): { x: number; y: number } | null {
   if (
     formation.campAnchor &&
@@ -260,14 +317,12 @@ function formationPosition(formation: Formation): { x: number; y: number } | nul
     return formation.campAnchor;
   }
   if (formation.path.length < 2) return null;
-  const idx = Math.floor(Math.max(0, Math.min(1, formation.t)) * (formation.path.length - 1));
-  return formation.path[idx];
+  return interpolateAlongRoute(formation.path, formation.t);
 }
 
 function routePointAtT(route: { x: number; y: number }[], t: number): { x: number; y: number } | null {
   if (route.length < 2) return null;
-  const idx = Math.floor(Math.max(0, Math.min(1, t)) * (route.length - 1));
-  return route[idx] ?? null;
+  return interpolateAlongRoute(route, t);
 }
 
 function closestRouteProgress(
@@ -308,16 +363,155 @@ function campRingOffset(
   return { lx, ly, faceRight: lx < 0 };
 }
 
+/** World position for a formation — matches the render path/route sampling. */
+function approximateFormationCenter(
+  line: TroopLine,
+  formation: Formation
+): { x: number; y: number } | null {
+  if (
+    formation.campAnchor &&
+    (formation.state === "buildingCamp" ||
+      formation.state === "camping" ||
+      formation.state === "celebrating")
+  ) {
+    return formation.campAnchor;
+  }
+  const route = formation.path.length > 1 ? formation.path : line.path;
+  if (route.length < 2) return null;
+  return interpolateAlongRoute(route, formation.t);
+}
+
+function collectCampaignFocusPoints(
+  line: TroopLine,
+  side: "attacker" | "defender"
+): { x: number; y: number }[] {
+  const wantDefender = side === "defender";
+  const pts: { x: number; y: number }[] = [];
+  for (const f of line.formations) {
+    if (f.state === "cooldown") continue;
+    if (f.isDefender !== wantDefender) continue;
+    const p = approximateFormationCenter(line, f);
+    if (p) pts.push(p);
+  }
+  return pts;
+}
+
+function drawCampaignFocusIndicator(
+  ctx: CanvasRenderingContext2D,
+  line: TroopLine,
+  tick: number,
+  side: "attacker" | "defender"
+) {
+  const pts = collectCampaignFocusPoints(line, side);
+  let cx: number;
+  let cy: number;
+  let radius: number;
+  if (pts.length === 0) {
+    cx = line.territory.x;
+    cy = line.territory.y + 6;
+    radius = 48;
+  } else {
+    cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+    cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+    let maxD = 0;
+    for (const p of pts) {
+      maxD = Math.max(maxD, Math.hypot(p.x - cx, p.y - cy));
+    }
+    radius = Math.max(36, Math.min(102, maxD + 28));
+  }
+
+  const pulse = 0.06 * Math.sin(tick * 0.004);
+  const label =
+    line.territory.company.length > 30
+      ? `${line.territory.company.slice(0, 27)}…`
+      : line.territory.company;
+
+  ctx.save();
+  ctx.fillStyle = `rgba(255, 230, 190, ${0.045 + pulse * 0.5})`;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = `rgba(200, 160, 90, ${0.38 + pulse})`;
+  ctx.lineWidth = 1.35;
+  ctx.setLineDash([7, 5]);
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.font = "600 11px system-ui, -apple-system, Segoe UI, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "bottom";
+  ctx.fillStyle = "rgba(42, 32, 20, 0.92)";
+  ctx.shadowColor = "rgba(255, 248, 230, 0.95)";
+  ctx.shadowBlur = 4;
+  ctx.fillText(label, cx, cy - radius - 6);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+type CampaignFocusPick = { territoryId: string; side: "attacker" | "defender" };
+
+function pickCampaignAtWorld(
+  wx: number,
+  wy: number,
+  layout: { territories: Territory[] },
+  lines: TroopLine[]
+): CampaignFocusPick | null {
+  let best: CampaignFocusPick | null = null;
+  let bestD = Infinity;
+
+  for (const line of lines) {
+    for (const f of line.formations) {
+      if (f.state === "cooldown") continue;
+      const p = approximateFormationCenter(line, f);
+      if (!p) continue;
+      const d = Math.hypot(p.x - wx, p.y - wy);
+      if (d < 44 && d < bestD) {
+        bestD = d;
+        best = {
+          territoryId: line.territory.id,
+          side: f.isDefender ? "defender" : "attacker",
+        };
+      }
+    }
+  }
+
+  for (const t of layout.territories) {
+    const d = Math.hypot(t.x - wx, t.y - wy);
+    if (d < 58 && d < bestD) {
+      bestD = d;
+      // Fortress click: follow the attacking campaign from the castle by default
+      best = { territoryId: t.id, side: "attacker" };
+    }
+  }
+
+  return best;
+}
+
 export default function BattleMap({ applications, onStatsUpdate, onReady }: BattleMapProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animFrameRef = useRef<number>(0);
+  const animFrameRef = useRef<number | null>(null);
   const troopLinesRef = useRef<TroopLine[]>([]);
   const effectsRef = useRef<LiveEffect[]>([]);
   const cameraRef = useRef<Camera>({ x: 0, y: 0, zoom: 1 });
-  const dragRef = useRef<{ dragging: boolean; lastX: number; lastY: number }>({
+  /** Highlight one side’s formations (attacker vs defender) for a territory. */
+  const campaignFocusRef = useRef<CampaignFocusPick | null>(null);
+  const dragRef = useRef<{
+    dragging: boolean;
+    lastX: number;
+    lastY: number;
+    startX: number;
+    startY: number;
+    moved: boolean;
+  }>({
     dragging: false,
     lastX: 0,
     lastY: 0,
+    startX: 0,
+    startY: 0,
+    moved: false,
   });
   const spritesRef = useRef<{
     marching?: SpriteFrames;
@@ -343,6 +537,31 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
   } | null>(null);
   const screenRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const [isReady, setIsReady] = useState(false);
+  const bearPatrolRef = useRef<LaneBearPatrol[]>([]);
+  const bearFramesRef = useRef<(HTMLCanvasElement | null)[]>([]);
+  const lastBearTickRef = useRef(0);
+
+  useEffect(() => {
+    const urls = [...BEAR_DIRECTION_FRAME_URLS];
+    bearFramesRef.current = urls.map(() => null);
+    urls.forEach((src, i) => {
+      const img = new Image();
+      img.decoding = "async";
+      img.src = src;
+      img.onload = () => {
+        try {
+          bearFramesRef.current[i] = keyBearBackground(img);
+        } catch {
+          const c = document.createElement("canvas");
+          c.width = img.naturalWidth;
+          c.height = img.naturalHeight;
+          const x = c.getContext("2d");
+          if (x) x.drawImage(img, 0, 0);
+          bearFramesRef.current[i] = c;
+        }
+      };
+    });
+  }, []);
 
   const initialize = useCallback(() => {
     const canvas = canvasRef.current;
@@ -378,7 +597,11 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     for (const territory of layout.territories) {
       spritesRef.current.fortresses.set(
         territory.id,
-        generateFortressSprite(territory.company, territory.status)
+        generateFortressSprite(
+          territory.company,
+          territory.status,
+          hiringWallRingCount(territory)
+        )
       );
     }
 
@@ -468,6 +691,27 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     }
     troopLinesRef.current = lines;
 
+    const eligible: number[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].status !== "fallen" && lines[i].path.length >= 2) eligible.push(i);
+    }
+    const want = Math.min(6, Math.max(2, Math.ceil(eligible.length * 0.35)));
+    const patrols: LaneBearPatrol[] = [];
+    for (let k = 0; k < want && eligible.length > 0; k++) {
+      const lineIndex = eligible[Math.floor(Math.random() * eligible.length)];
+      patrols.push({
+        lineIndex,
+        t: 0.12 + Math.random() * 0.76,
+        speed: 0.014 + Math.random() * 0.018,
+        alongDir: Math.random() > 0.5 ? 1 : -1,
+        phase: Math.random() * Math.PI * 2,
+      });
+    }
+    bearPatrolRef.current = patrols;
+    lastBearTickRef.current = 0;
+
+    campaignFocusRef.current = null;
+
     if (onStatsUpdate) {
       onStatsUpdate({
         total: layout.territories.length,
@@ -487,12 +731,24 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     if (!canvas) return;
 
     const onMouseDown = (e: MouseEvent) => {
-      dragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY };
+      dragRef.current = {
+        dragging: true,
+        lastX: e.clientX,
+        lastY: e.clientY,
+        startX: e.clientX,
+        startY: e.clientY,
+        moved: false,
+      };
       canvas.style.cursor = "grabbing";
     };
 
     const onMouseMove = (e: MouseEvent) => {
       if (!dragRef.current.dragging) return;
+      if (
+        Math.hypot(e.clientX - dragRef.current.startX, e.clientY - dragRef.current.startY) > 5
+      ) {
+        dragRef.current.moved = true;
+      }
       const dx = e.clientX - dragRef.current.lastX;
       const dy = e.clientY - dragRef.current.lastY;
       dragRef.current.lastX = e.clientX;
@@ -503,9 +759,29 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
       cam.y -= dy / cam.zoom;
     };
 
-    const onMouseUp = () => {
-      dragRef.current.dragging = false;
+    const onMouseUp = (e: MouseEvent) => {
+      const d = dragRef.current;
+      const wasTap =
+        d.dragging &&
+        !d.moved &&
+        Math.hypot(e.clientX - d.startX, e.clientY - d.startY) < 8;
+      d.dragging = false;
       canvas.style.cursor = "grab";
+
+      if (wasTap && layoutRef.current) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const cam = cameraRef.current;
+        const wx = cam.x + mx / cam.zoom;
+        const wy = cam.y + my / cam.zoom;
+        campaignFocusRef.current = pickCampaignAtWorld(
+          wx,
+          wy,
+          layoutRef.current,
+          troopLinesRef.current
+        );
+      }
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -537,10 +813,15 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
 
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
+        const tx = e.touches[0].clientX;
+        const ty = e.touches[0].clientY;
         dragRef.current = {
           dragging: true,
-          lastX: e.touches[0].clientX,
-          lastY: e.touches[0].clientY,
+          lastX: tx,
+          lastY: ty,
+          startX: tx,
+          startY: ty,
+          moved: false,
         };
       } else if (e.touches.length === 2) {
         lastTouchDist = Math.hypot(
@@ -555,10 +836,14 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     const onTouchMove = (e: TouchEvent) => {
       e.preventDefault();
       if (e.touches.length === 1 && dragRef.current.dragging) {
-        const dx = e.touches[0].clientX - dragRef.current.lastX;
-        const dy = e.touches[0].clientY - dragRef.current.lastY;
-        dragRef.current.lastX = e.touches[0].clientX;
-        dragRef.current.lastY = e.touches[0].clientY;
+        const t = e.touches[0];
+        if (Math.hypot(t.clientX - dragRef.current.startX, t.clientY - dragRef.current.startY) > 8) {
+          dragRef.current.moved = true;
+        }
+        const dx = t.clientX - dragRef.current.lastX;
+        const dy = t.clientY - dragRef.current.lastY;
+        dragRef.current.lastX = t.clientX;
+        dragRef.current.lastY = t.clientY;
         const cam = cameraRef.current;
         cam.x -= dx / cam.zoom;
         cam.y -= dy / cam.zoom;
@@ -574,8 +859,26 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
       }
     };
 
-    const onTouchEnd = () => {
-      dragRef.current.dragging = false;
+    const onTouchEnd = (e: TouchEvent) => {
+      const d = dragRef.current;
+      if (e.changedTouches.length === 1 && d.dragging && !d.moved && layoutRef.current) {
+        const t = e.changedTouches[0];
+        if (Math.hypot(t.clientX - d.startX, t.clientY - d.startY) < 12) {
+          const rect = canvas.getBoundingClientRect();
+          const mx = t.clientX - rect.left;
+          const my = t.clientY - rect.top;
+          const cam = cameraRef.current;
+          const wx = cam.x + mx / cam.zoom;
+          const wy = cam.y + my / cam.zoom;
+          campaignFocusRef.current = pickCampaignAtWorld(
+            wx,
+            wy,
+            layoutRef.current,
+            troopLinesRef.current
+          );
+        }
+      }
+      d.dragging = false;
     };
 
     canvas.addEventListener("mousedown", onMouseDown);
@@ -597,6 +900,14 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
       canvas.removeEventListener("touchmove", onTouchMove);
       canvas.removeEventListener("touchend", onTouchEnd);
     };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") campaignFocusRef.current = null;
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   // --- Render loop ---
@@ -625,6 +936,9 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     const layout = layoutRef.current;
     const sprites = spritesRef.current;
     const tick = Date.now();
+    const prevBear = lastBearTickRef.current;
+    const bearDt = prevBear > 0 ? Math.min(0.064, (tick - prevBear) / 1000) : 1 / 60;
+    lastBearTickRef.current = tick;
 
     if (sprites.worldBg) {
       ctx.drawImage(sprites.worldBg, 0, 0);
@@ -634,12 +948,37 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
     for (const territory of layout.territories) {
       const fortressSprite = sprites.fortresses.get(territory.id);
       if (fortressSprite) {
-        ctx.drawImage(fortressSprite, territory.x - 40, territory.y - 32);
+        ctx.drawImage(
+          fortressSprite,
+          territory.x - FORTRESS_SPRITE_DRAW_DX,
+          territory.y - FORTRESS_SPRITE_DRAW_DY
+        );
       }
       if (territory.status === "fallen") {
         const rejectCount = territory.applications.filter((a) => a.status === "reject").length;
         drawCasualtyCounter(ctx, territory.x, territory.y - 38, rejectCount);
       }
+    }
+
+    // Bear patrol: north/south/side art by travel heading + per-profile walk motion
+    const bearFrames = bearFramesRef.current;
+    const linesForBears = troopLinesRef.current;
+    for (const b of bearPatrolRef.current) {
+      const line = linesForBears[b.lineIndex];
+      if (!line || line.status === "fallen" || line.path.length < 2) continue;
+      b.t += b.speed * bearDt * b.alongDir;
+      if (b.t >= 1) {
+        b.t = 1;
+        b.alongDir = -1;
+      } else if (b.t <= 0) {
+        b.t = 0;
+        b.alongDir = 1;
+      }
+      const pt = interpolateAlongRoute(line.path, b.t);
+      const tan = routeDirectionAtT(line.path, b.t);
+      const dx = tan.dx * b.alongDir;
+      const dy = tan.dy * b.alongDir;
+      drawPatrolBearSprite(ctx, bearFrames, pt.x, pt.y, tick, b.phase, dx, dy, b.t * b.alongDir);
     }
 
     // ========== FORMATION LIFECYCLE UPDATE + RENDER ==========
@@ -657,6 +996,12 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
             const fx = line.territory.x - 20 + i * 15;
             const fy = line.territory.y + 22 + (i % 2) * 5;
             ctx.drawImage(sprites.fallen.frames[0], fx, fy);
+          }
+        }
+        {
+          const focus = campaignFocusRef.current;
+          if (focus && focus.territoryId === line.territory.id) {
+            drawCampaignFocusIndicator(ctx, line, tick, focus.side);
           }
         }
         continue;
@@ -778,6 +1123,7 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
 
           case "marching":
             formation.t += formation.speed;
+
             if (formation.t >= 0.92) {
               if (!formation.isDefender && formation.objective === "toFortress") {
                 formation.state = "sieging";
@@ -1006,12 +1352,18 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
         }
       }
 
+      {
+        const focus = campaignFocusRef.current;
+        if (focus && focus.territoryId === line.territory.id) {
+          drawCampaignFocusIndicator(ctx, line, tick, focus.side);
+        }
+      }
+
       // -- Render each formation --
       for (const formation of line.formations) {
         if (formation.state === "cooldown") continue;
 
         let pos: { x: number; y: number };
-        let nextPos: { x: number; y: number };
         let dirX: number;
         let dirY: number;
         let perpX: number;
@@ -1032,19 +1384,17 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
           dirY = 0;
           perpX = 0;
           perpY = 1;
-          nextPos = { x: pos.x + dirX, y: pos.y };
         } else {
           const route = formation.path.length > 1 ? formation.path : line.path;
           if (route.length < 2) continue;
-          const pathLen = route.length - 1;
           const clampedT = Math.max(0, Math.min(1, formation.t));
-          const pathIndex = Math.floor(clampedT * pathLen);
-          pos = route[pathIndex];
-          const nextIndex = Math.min(pathIndex + 1, pathLen);
-          nextPos = route[nextIndex];
-
-          const ddx = nextPos.x - pos.x;
-          const ddy = nextPos.y - pos.y;
+          const pathLen = route.length - 1;
+          const floatPos = clampedT * pathLen;
+          const i0 = Math.min(Math.floor(floatPos), pathLen - 1);
+          const i1 = Math.min(i0 + 1, pathLen);
+          pos = interpolateAlongRoute(route, formation.t);
+          const ddx = route[i1].x - route[i0].x;
+          const ddy = route[i1].y - route[i0].y;
           const pathDirLen = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
           dirX = ddx / pathDirLen;
           dirY = ddy / pathDirLen;
@@ -1742,6 +2092,95 @@ export default function BattleMap({ applications, onStatsUpdate, onReady }: Batt
 }
 
 // -- Drawing helpers --
+
+/** Index 0 = north (−Y), 1 = south (+Y), 2 = side (±X, flip when west). */
+const BEAR_DIRECTION_FRAME_URLS = [
+  "/bear/bear_north.png",
+  "/bear/bear_south.png",
+  "/bear/bear_side.png",
+] as const;
+
+const BEAR_TARGET_H = 40;
+
+function bearSpriteForHeading(dx: number, dy: number): { frame: 0 | 1 | 2; flipX: boolean } {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (ax > ay) {
+    return dx >= 0 ? { frame: 2, flipX: false } : { frame: 2, flipX: true };
+  }
+  return dy > 0 ? { frame: 1, flipX: false } : { frame: 0, flipX: false };
+}
+
+/** Per-profile walk: bob, squash, light sway (no extra texture frames). */
+function bearWalkMotion(
+  tick: number,
+  phase: number,
+  frame: 0 | 1 | 2,
+  pathPhase: number
+): { bob: number; squashX: number; squashY: number; sway: number } {
+  const t = tick * 0.001;
+  const leg = Math.sin(t * 24 + phase * 1.4 + pathPhase * 12);
+  if (frame === 0) {
+    return {
+      bob: Math.sin(t * 11 + phase) * 1.55 + leg * 0.35,
+      squashX: 1 + leg * 0.022,
+      squashY: 1 - leg * 0.028,
+      sway: Math.sin(t * 9 + phase) * 0.045,
+    };
+  }
+  if (frame === 1) {
+    return {
+      bob: Math.sin(t * 12 + phase * 1.1) * 1.9 + leg * 0.42,
+      squashX: 1 + Math.sin(t * 22 + phase) * 0.026,
+      squashY: 1 - Math.sin(t * 22 + phase + 0.4) * 0.032,
+      sway: Math.sin(t * 8.5 + phase) * 0.038,
+    };
+  }
+  return {
+    bob: Math.sin(t * 13 + phase) * 1.7 + leg * 0.38,
+    squashX: 1 + leg * 0.03,
+    squashY: 1 - leg * 0.03,
+    sway: Math.sin(t * 10 + phase * 1.2) * 0.065,
+  };
+}
+
+function drawPatrolBearSprite(
+  ctx: CanvasRenderingContext2D,
+  frames: (HTMLCanvasElement | null)[],
+  x: number,
+  y: number,
+  tick: number,
+  phase: number,
+  dirX: number,
+  dirY: number,
+  pathPhase: number
+) {
+  const { frame, flipX } = bearSpriteForHeading(dirX, dirY);
+  let img = frames[frame] ?? null;
+  if (!img || img.width < 1 || img.height < 1) {
+    img = frames.find((f) => f && f.width > 0 && f.height > 0) ?? null;
+  }
+  if (!img) return;
+
+  const motion = bearWalkMotion(tick, phase, frame, pathPhase);
+  const scale = BEAR_TARGET_H / img.height;
+  const dw = img.width * scale;
+  const dh = BEAR_TARGET_H;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(20, 16, 12, 0.22)";
+  ctx.beginPath();
+  ctx.ellipse(x, y + motion.bob + 5, dw * 0.38, 7, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.translate(x, y + motion.bob);
+  ctx.rotate(motion.sway);
+  ctx.scale(motion.squashX, motion.squashY);
+  if (flipX) ctx.scale(-1, 1);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, -dw * 0.5, -dh + 8, dw, dh);
+  ctx.restore();
+}
 
 function drawCasualtyCounter(ctx: CanvasRenderingContext2D, x: number, y: number, count: number) {
   ctx.save();

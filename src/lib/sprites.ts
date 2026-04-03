@@ -704,9 +704,175 @@ export function generateCastleSprite(name: string, isPlayer: boolean): HTMLCanva
   return canvas;
 }
 
-export function generateFortressSprite(name: string, status: string): HTMLCanvasElement {
-  const w = 80, h = 65;
-  const [canvas, ctx] = createCanvas(w, h);
+/** Inner fort art coordinate space (keep layout math); canvas may extend right/down for wide rings. */
+export const FORTRESS_SPRITE_INNER_W = 80;
+export const FORTRESS_SPRITE_INNER_H = 82;
+/** Hiring ring geometry (must match `generateFortressSprite` single-ring extents for padding math). */
+const HIRING_RING_CX = FORTRESS_SPRITE_INNER_W / 2;
+const HIRING_OUTER_RX = 94;
+const HIRING_OUTER_RY = 44;
+const HIRING_RING_MARGIN = 38;
+const _hirMinX = Math.min(0, HIRING_RING_CX - HIRING_OUTER_RX - HIRING_RING_MARGIN);
+/** Left pad: ring geometry can extend to negative X in inner space; right pad is a fixed gutter (ring width uses W formula). */
+export const FORTRESS_SPRITE_PAD_L = Math.max(36, Math.ceil(-_hirMinX) + 14);
+export const FORTRESS_SPRITE_PAD_R = 40;
+export const FORTRESS_SPRITE_PAD_T = 24;
+export const FORTRESS_SPRITE_PAD_B = 36;
+
+/** Inner-art anchor at (40, 32) — pass to drawImage as `territory.x - dx`, `territory.y - dy`. */
+export const FORTRESS_SPRITE_DRAW_DX = FORTRESS_SPRITE_PAD_L + 40;
+export const FORTRESS_SPRITE_DRAW_DY = FORTRESS_SPRITE_PAD_T + 32;
+
+/** Light courtyard strip between two ellipses (reads as open ground between walls). */
+function drawHiringCourtyardGap(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  rxOut: number,
+  ryOut: number,
+  rxIn: number,
+  ryIn: number,
+  fill: string
+) {
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rxOut, ryOut, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, cy, rxIn, ryIn, 0, 0, Math.PI * 2, true);
+  ctx.fillStyle = fill;
+  ctx.fill("evenodd");
+}
+
+/**
+ * One elliptical wall band: vertical gradient + south-face depth + base shadow so it reads
+ * as standing masonry (pseudo-isometric), not a flat track on the ground.
+ */
+function drawHiringIsoWallBand(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  rxOut: number,
+  ryOut: number,
+  rxIn: number,
+  ryIn: number,
+  palette: { light: string; face: string; dark: string; rim: string; shadow: string }
+) {
+  ctx.save();
+
+  // Solid wall reads better with a grounded shadow just underneath (no visible “gap”).
+  const baseDrop = Math.max(2.5, ryOut * 0.08);
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + baseDrop, rxOut * 1.01, ryOut * 0.98, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, cy + baseDrop, rxIn * 0.99, ryIn * 0.98, 0, 0, Math.PI * 2, true);
+  ctx.fillStyle = palette.shadow;
+  ctx.globalAlpha = 0.45;
+  ctx.fill("evenodd");
+  ctx.globalAlpha = 1;
+
+  const capLift = Math.max(1.0, ryOut * 0.07);
+
+  const grad = ctx.createLinearGradient(cx, cy - ryOut * 1.55, cx, cy + ryOut * 1.85);
+  grad.addColorStop(0, palette.light);
+  grad.addColorStop(0.32, palette.face);
+  grad.addColorStop(0.62, palette.dark);
+  grad.addColorStop(0.88, "#2a2218");
+  grad.addColorStop(1, "#1e1810");
+
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rxOut, ryOut, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, cy, rxIn, ryIn, 0, 0, Math.PI * 2, true);
+  ctx.fillStyle = grad;
+  ctx.fill("evenodd");
+
+  // South-face mass (heavier shadow = more “height” toward camera)
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rxOut, ryOut, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, cy, rxIn, ryIn, 0, 0, Math.PI * 2, true);
+  ctx.clip("evenodd");
+  const shade = ctx.createLinearGradient(0, cy - ryOut * 0.15, 0, cy + ryOut * 1.45);
+  shade.addColorStop(0, "rgba(0,0,0,0)");
+  shade.addColorStop(0.45, "rgba(22,16,12,0)");
+  shade.addColorStop(1, "rgba(12,8,6,0.58)");
+  ctx.fillStyle = shade;
+  ctx.fillRect(cx - rxOut - 6, cy - ryOut - 6, rxOut * 2 + 12, ryOut * 2 + 18);
+  ctx.restore();
+
+  // Ground contact: darken only the bottom of the band (reads anchored, not hovering)
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rxOut, ryOut, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, cy, rxIn, ryIn, 0, 0, Math.PI * 2, true);
+  ctx.clip("evenodd");
+  const gContact = ctx.createLinearGradient(0, cy + ryOut * 0.15, 0, cy + ryOut * 1.05);
+  gContact.addColorStop(0, "rgba(0,0,0,0)");
+  gContact.addColorStop(0.55, "rgba(0,0,0,0)");
+  gContact.addColorStop(1, "rgba(18, 12, 8, 0.18)");
+  ctx.fillStyle = gContact;
+  ctx.fillRect(cx - rxOut - 4, cy - 4, rxOut * 2 + 8, ryOut + 10);
+  ctx.restore();
+
+  // Parapet cap — offset “up” on screen (north) to echo keep battlements
+  ctx.save();
+  ctx.globalAlpha = 0.88;
+  ctx.strokeStyle = palette.rim;
+  ctx.lineWidth = 3.0;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - capLift, rxOut + 0.95, ryOut + 0.65, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rxOut - 0.35, ryOut - 0.35, 0, 0, Math.PI * 2);
+  ctx.strokeStyle = palette.rim;
+  ctx.lineWidth = 1.05;
+  ctx.stroke();
+
+  ctx.strokeStyle = "rgba(22, 14, 10, 0.62)";
+  ctx.lineWidth = 0.75;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rxIn + 0.5, ryIn + 0.5, 0, 0, Math.PI * 2);
+  ctx.stroke();
+
+  const midRx = (rxOut + rxIn) * 0.5;
+  const midRy = (ryOut + ryIn) * 0.5;
+  ctx.strokeStyle = "rgba(40, 32, 24, 0.22)";
+  ctx.lineWidth = 0.5;
+  ctx.setLineDash([2, 3]);
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, midRx, midRy, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+export function generateFortressSprite(
+  name: string,
+  status: string,
+  hiringWallRings: number = 0
+): HTMLCanvasElement {
+  const innerW = FORTRESS_SPRITE_INNER_W;
+  const innerH = FORTRESS_SPRITE_INNER_H;
+  const padL = FORTRESS_SPRITE_PAD_L;
+  const padT = FORTRESS_SPRITE_PAD_T;
+  const padR = FORTRESS_SPRITE_PAD_R;
+  const padB = FORTRESS_SPRITE_PAD_B;
+  const ringCx = innerW / 2;
+  const ringCy = 40;
+  const ringsN = Math.max(0, Math.min(4, Math.round(hiringWallRings)));
+  const willDrawRings = ringsN > 0 && status !== "fallen";
+  // For now: show a single (bigger/taller) wall ring so it reads as walls.
+  const effectiveRings = willDrawRings ? 1 : 0;
+  const outerRx = effectiveRings ? HIRING_OUTER_RX : 0;
+  const outerRy = effectiveRings ? HIRING_OUTER_RY : 0;
+  const ringMargin = HIRING_RING_MARGIN;
+  const minDrawX = effectiveRings ? Math.min(0, ringCx - outerRx - ringMargin) : 0;
+  const maxDrawX = effectiveRings ? Math.max(innerW, ringCx + outerRx + ringMargin) : innerW;
+  const maxDrawY = effectiveRings ? Math.max(innerH, ringCy + outerRy + 32) : innerH;
+  const W = Math.ceil(
+    effectiveRings ? padL + maxDrawX + 14 : padL + innerW + padR
+  );
+  const H = Math.ceil(
+    effectiveRings ? padT + maxDrawY + 18 : padT + innerH + padB
+  );
+  const [canvas, ctx] = createCanvas(W, H);
 
   const isFallen = status === "fallen";
   const isSieging = status === "sieging";
@@ -738,7 +904,66 @@ export function generateFortressSprite(name: string, status: string): HTMLCanvas
     flagColor = "#daa520";
   }
 
+  ctx.save();
+  ctx.translate(padL, padT);
+
   ctx.globalAlpha = isFallen ? 0.5 : 1;
+
+  // Hiring funnel: wide discrete iso wall bands + courtyard gaps (canvas grows with outer radius)
+  const rings = effectiveRings;
+  if (rings > 0 && !isFallen) {
+    const cx = ringCx;
+    const cy = ringCy;
+    const pal = isConquered
+      ? {
+          light: "#c4b498",
+          face: "#9d8a70",
+          dark: "#5e4e3a",
+          rim: "#d8c8a8",
+          shadow: "rgba(32, 26, 18, 0.9)",
+        }
+      : isSieging
+        ? {
+            light: "#a8907c",
+            face: "#7d6656",
+            dark: "#453028",
+            rim: "#b89880",
+            shadow: "rgba(28, 18, 14, 0.92)",
+          }
+        : {
+            light: "#b0a090",
+            face: "#847566",
+            dark: "#4a3c32",
+            rim: "#c4b4a0",
+            shadow: "rgba(26, 20, 14, 0.9)",
+          };
+    const gapFill = isSieging
+      ? "rgba(200, 160, 130, 0.16)"
+      : "rgba(210, 190, 160, 0.2)";
+    // Single thick wall band (solid masonry read).
+    const wallW = 14.5;
+    const gapW = 7.0;
+    let rxO = outerRx;
+    let ryO = outerRy;
+
+    for (let i = 0; i < rings; i++) {
+      const kScale = ryO / Math.max(rxO, 0.01);
+      const rxI = Math.max(0.8, rxO - wallW);
+      const ryI = Math.max(0.8, ryO - wallW * kScale);
+
+      drawHiringIsoWallBand(ctx, cx, cy, rxO, ryO, rxI, ryI, pal);
+
+      if (i < rings - 1) {
+        const rxGapOut = rxI;
+        const ryGapOut = ryI;
+        const rxGapIn = Math.max(0.6, rxI - gapW);
+        const ryGapIn = Math.max(0.6, ryI - gapW * kScale);
+        drawHiringCourtyardGap(ctx, cx, cy, rxGapOut, ryGapOut, rxGapIn, ryGapIn, gapFill);
+        rxO = rxGapIn;
+        ryO = ryGapIn;
+      }
+    }
+  }
 
   // Offset fortress drawing to center in the wider canvas
   const ox = 10;
@@ -831,7 +1056,7 @@ export function generateFortressSprite(name: string, status: string): HTMLCanvas
   if (isSieging) {
     ctx.fillStyle = "rgba(255, 100, 0, 0.3)";
     ctx.beginPath();
-    ctx.arc(w / 2, wallTop + wallHeight / 2, 22, 0, Math.PI * 2);
+    ctx.arc(innerW / 2, wallTop + wallHeight / 2, 22, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -840,7 +1065,9 @@ export function generateFortressSprite(name: string, status: string): HTMLCanvas
   const fontSize = Math.max(10, Math.min(13, 100 / name.length));
   ctx.font = `bold ${fontSize}px Georgia, serif`;
   ctx.textAlign = "center";
-  ctx.fillText(name, w / 2, 55, 76);
+  ctx.fillText(name, innerW / 2, rings > 0 && !isFallen ? 78 : 55, 76);
+
+  ctx.restore();
 
   return canvas;
 }
